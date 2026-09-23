@@ -1,0 +1,88 @@
+# AstroPipe — Seestar raw FITS → finished astrophoto
+
+An end-to-end pipeline that turns the raw `.fit` subs saved by a ZWO Seestar
+(S50 / S50 Pro / S30) into a finished image. It
+handles the whole chain: frame grading, cloud/tree/obstruction rejection,
+registration with alt-az field rotation, local normalisation, sigma-clipped
+Bayer-drizzle integration, AI denoising, gradient removal, deconvolution,
+star separation, narrowband palettes, stretching and export to a
+full-resolution JPEG + 16-bit TIFF. It includes a web UI and a CLI.
+
+Nothing is tuned for a particular object. Every decision comes from the
+FITS headers (`BAYERPAT`, `BIAS`, `FILTER`, `EXPTIME`, …) and from statistics
+of the data. The `LP` dual-band filter automatically gets an Ha/OIII (HOO)
+workflow, and the `IRCUT` broadband filter gets a natural-colour RGB workflow.
+
+## Quick start
+
+```bash
+source .venv/bin/activate
+pip install -r requirements.txt          # or: uv pip install -r requirements.txt
+
+# Web UI  →  http://127.0.0.1:8000
+python -m webui.server                   # --images /path/to/Seestar/MyWorks  --port 8080  --host 0.0.0.0
+
+# or headless, one command:
+python -m astropipe run "images/IC 5070_sub"
+python -m astropipe run DIR --palette hoo --saturation 1.8 --scale 1.5 --upscale 2 --device cuda
+python -m astropipe analyse DIR          # just the frame-quality report
+python -m astropipe devices              # show GPUs PyTorch can use
+```
+
+Point the UI or CLI at any folder of Seestar subs, for example the
+`<Object>_sub` folders the Seestar writes. JPG thumbnails and non-light
+frames are ignored. Results are cached in `output/<folder>-<hash>/`:
+`stack.fits`, the two half stacks, `denoised.fits`, the coverage and
+rejection maps, and `exports/`.
+
+### NVIDIA GPUs (Windows / Linux)
+
+The AI denoiser runs on NVIDIA CUDA, Apple Metal (MPS) or CPU. The default
+PyTorch wheel on Windows/Linux is often CPU-only, so install the CUDA build:
+
+```bash
+python -m venv .venv && .venv\Scripts\activate      # Windows  (Linux: source .venv/bin/activate)
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+python -m astropipe devices          # should list your RTX card
+```
+
+On CUDA the denoiser uses mixed precision (bf16 on RTX 30/40/50, fp16 on
+older cards). It sizes the training batch and the inference tiles to the
+card's VRAM: 8 GB cards work fine, and 4–6 GB cards use smaller tiles. Pick a
+specific GPU with `--device cuda:1`, or with `ASTROPIPE_DEVICE=cuda:1`. The
+UI also has a device selector. Everything outside the denoiser (NumPy,
+OpenCV, SEP) runs on the CPU and is platform-independent.
+
+## What happens to your data
+
+| Stage | Technique |
+|---|---|
+| **Calibration** | Black level from the FITS `BIAS` header. There are no dark frames, so hot and warm pixels are found from the temporal median of unregistered subs: sky drifts between frames but sensor defects don't. A pixel is flagged when it is an isolated same-colour outlier, which protects star cores. |
+| **Frame grading** | SEP star extraction on every sub measures star count, FWHM, elongation (wind or tracking trails), sky level and noise. |
+| **Registration** | Asterism (triangle) matching, then RANSAC similarity refinement on every matched star. This handles the alt-az field rotation of the Seestar, which can reach about 100° over a long session. A robust **third-order polynomial distortion model** is then fitted per frame to hundreds of matched stars, which keeps edge stars round as the field rotates across the optics. |
+| **Cloud / obstruction detection** | Reference-star photometry: each bright reference star that should appear in a frame is looked up, and the flux ratio is aggregated on a tile grid. Tiles whose stars dim or vanish (a tree, a roof, a passing cloud) become per-frame masks, so a partly blocked frame still contributes its clean area. |
+| **Rejection & weighting** | Robust median/MAD tests on each metric, plus an unsupervised **Isolation Forest** over the multivariate metrics. Weights are signal²/noise² × sharpness. Sensitivity is adjustable, and each frame can be overridden in the UI. |
+| **Integration** | Streaming three-pass integration with bounded memory (hundreds of subs fit in 16 GB of RAM). **Local normalisation** removes each frame's rotating gradient against the running mean. Weighted **sigma clipping** removes satellites, planes and cosmic rays. **Bayer drizzle** resamples each colour's samples directly, with no demosaic interpolation. Optional 1.5× or 2× output uses the dithering and rotation between frames. Frames alternate between two independent **half stacks**. |
+| **AI denoise** | **Noise2Noise**: a U-Net is trained *on your own data* to map half-stack A to half-stack B. Because the noise in the two is independent, the network learns the expected clean signal for this exact sensor, sky and integration. It uses no pretrained weights, so it can't invent detail from other people's images. Training runs in a variance-stabilised (asinh) domain, and bright star cores are handed back unchanged. |
+| **Gradient removal** | Tile samples with stars masked. An iterative *lower-envelope* surface fit (polynomial or thin-plate RBF) rejects samples sitting on nebulosity or galaxies. When nebulosity dominates the field, the model order is reduced automatically. |
+| **Crop** | Largest fully covered rectangle, found by an aspect-ratio search on the coverage map and centred on the deepest part of the stack. The minimum coverage is adjustable. |
+| **Colour** | Background neutralisation and star-based white balance (aperture photometry of unsaturated stars). Pixels clipped in any channel are rendered neutral. Without this, white-balance gains turn saturated cores blue or purple. |
+| **Deconvolution** | Richardson–Lucy with a **PSF measured from your stars** (median of sub-pixel re-centred isolated stars), with total-variation regularisation, deringing, SNR masking and protection for saturated cores. |
+| **Star separation** | Stars are detected on a background mesh scaled to the PSF, so stars on galaxy discs separate cleanly. A concentration index keeps galaxy nuclei, M32/M110-type companions and nebula knots out of the star layer. Mask radii come from each star's measured per-channel radial profile, and push-pull inpainting with matched grain fills the gaps. |
+| **Star colour & halos** | Refractors bring blue/violet (and the OIII band) to a slightly different focus, so bright stars get coloured rings. Halo light above the local background is desaturated in linear data. The star layer uses a luminance-only stretch, true linear star colour and an "unscreen" recombination, which gives white cores with no coloured blooming, dark donuts or tints over bright backgrounds. |
+| **Stretch** | **Generalized Hyperbolic Stretch**. Its strength is solved automatically so that the starless background lands on a target level. It is colour-preserving, with luminance-preserving gamut mapping so that saturated highlights never darken. |
+| **Narrowband (LP filter)** | Ha comes from the red pixels and OIII from the green and blue pixels. Ha **leakage into OIII is estimated from the data** (lower envelope of OIII/Ha over high-SNR Ha pixels) and removed. OIII is then linearly fitted to Ha, both are stretched with one curve, and they are combined as **Foraxx** (dynamic), HOO or warm HOO. **Synthetic luminance** (LRGB-style) takes lightness from the best-SNR all-channel stretch, so red-dominant Ha regions keep their full brightness. |
+| **Finishing** | Post-stretch starlet shrinkage on luminance, OKLab chroma noise reduction, wavelet local contrast, perceptual (OKLab) vibrance with background protection, SCNR, curves and masked sharpening. |
+
+## Tips
+
+- **Presets** in the Process tab are starting points: *Balanced*, *Vivid nebula*,
+  *Galaxy / broadband*, *Natural colour* and so on.
+- Processing sliders re-render a fast preview in about a second. The heavy
+  stages (analysis, stacking, denoise) only re-run when you press their buttons.
+- If you change frame selection or sensitivity in the Frames tab, run
+  **Register & integrate** again, then **AI denoise**.
+- For very short sessions (fewer than about 15 subs) the stacker switches from
+  drizzle to demosaic automatically. The denoiser still works, but has less to learn from.
+- Export writes a JSON sidecar with every parameter, so a result can be reproduced.

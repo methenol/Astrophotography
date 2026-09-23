@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AstroPipe Studio</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">✦</span> AstroPipe <span class="muted">Studio</span></div>
+  <div class="dataset-title" id="datasetTitle">No dataset open</div>
+  <div class="badges"><span id="deviceBadge" class="badge">…</span><span id="versionBadge" class="badge ghost"></span></div>
+</header>
+
+<div class="layout">
+  <!-- ============ sidebar ============ -->
+  <aside class="sidebar">
+    <section class="card">
+      <h3>Dataset</h3>
+      <select id="datasetSelect"><option value="">Scanning…</option></select>
+      <div class="row gap">
+        <input id="customPath" type="text" placeholder="…or paste a folder path">
+        <button id="openCustom" class="btn small">Open</button>
+      </div>
+      <div id="datasetInfo" class="kv muted small"></div>
+    </section>
+
+    <section class="card">
+      <h3>Pipeline</h3>
+      <ol class="steps">
+        <li id="step-analyse"><span class="dot"></span><div><b>Analyse frames</b><small>stars, FWHM, clouds, obstructions, ML anomalies</small></div><button class="btn small" data-job="analyse">Run</button></li>
+        <li id="step-stack"><span class="dot"></span><div><b>Register &amp; integrate</b><small>local normalisation, sigma-clip, drizzle</small></div><button class="btn small" data-job="stack">Run</button></li>
+        <li id="step-denoise"><span class="dot"></span><div><b>AI denoise</b><small>self-supervised Noise2Noise on GPU</small></div><button class="btn small" data-job="denoise">Run</button></li>
+      </ol>
+      <button class="btn primary wide" data-job="all">▶ Run everything &amp; export</button>
+
+      <details class="adv">
+        <summary>Integration &amp; compute options</summary>
+        <label>Resampling <select id="sp-mode"><option value="auto">auto</option><option value="drizzle">Bayer drizzle</option><option value="demosaic">Demosaic + Lanczos</option></select></label>
+        <label>Output scale <select id="sp-scale"><option value="1">1× (native)</option><option value="1.5">1.5× drizzle</option><option value="2">2× drizzle</option></select></label>
+        <label>Rejection sensitivity <input id="sp-sensitivity" type="range" min="0.5" max="2" step="0.1" value="1"><output></output></label>
+        <label>Sigma low <input id="sp-sigma_low" type="number" step="0.5" value="4"></label>
+        <label>Sigma high <input id="sp-sigma_high" type="number" step="0.5" value="3"></label>
+        <label class="check"><input id="sp-local_norm" type="checkbox" checked> Local normalisation</label>
+        <label>Denoise training steps <input id="sp-denoise_iters" type="number" step="250" value="2000"></label>
+        <label>Compute device <select id="sp-device"></select></label>
+      </details>
+    </section>
+
+    <section class="card" id="jobCard" hidden>
+      <h3>Progress <button id="cancelJob" class="btn tiny ghost">Cancel</button></h3>
+      <div class="progress"><div id="progBar"></div></div>
+      <div id="progMsg" class="small"></div>
+      <div id="progLog" class="log"></div>
+    </section>
+  </aside>
+
+  <!-- ============ main ============ -->
+  <main class="main">
+    <nav class="tabs">
+      <button class="tab active" data-tab="process">Process</button>
+      <button class="tab" data-tab="frames">Frames <span id="framesCount" class="pill"></span></button>
+      <button class="tab" data-tab="export">Export</button>
+      <button class="tab" data-tab="diag">Diagnostics</button>
+    </nav>
+
+    <!-- PROCESS -->
+    <section class="tabpane active" id="tab-process">
+      <div class="studio">
+        <div class="viewer" id="viewer">
+          <div class="viewer-toolbar">
+            <div class="seg">
+              <button class="segbtn active" data-view="after">Processed</button>
+              <button class="segbtn" data-view="before">Before (raw stack)</button>
+              <button class="segbtn" data-view="split">Split</button>
+            </div>
+            <div class="seg">
+              <button class="segbtn" id="zoomFit">Fit</button>
+              <button class="segbtn" id="zoom100">1:1</button>
+              <select id="previewSize" title="preview resolution"><option value="1400">Fast preview</option><option value="2400">Detailed</option><option value="full">Full resolution</option></select>
+            </div>
+            <span id="renderInfo" class="muted small"></span>
+          </div>
+          <div class="canvas" id="canvas">
+            <div class="stage" id="stage">
+              <img id="imgAfter" alt="">
+              <div id="beforeWrap" class="beforeWrap"><img id="imgBefore" alt=""></div>
+              <div id="splitHandle" class="splitHandle" hidden></div>
+            </div>
+            <div class="placeholder" id="placeholder">
+              <div class="ph-inner">
+                <div class="big">✦</div>
+                <p>Choose a dataset, then run the pipeline.<br>Processing previews update live as you move the sliders.</p>
+              </div>
+            </div>
+            <div class="spinner" id="spinner" hidden></div>
+          </div>
+        </div>
+        <div class="controls" id="controls">
+          <div class="presetbar" id="presets"></div>
+          <div id="paramGroups"></div>
+          <div class="row gap sticky-bottom">
+            <button class="btn ghost" id="resetParams">Reset</button>
+            <button class="btn primary" id="exportBtn">Export JPG</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FRAMES -->
+    <section class="tabpane" id="tab-frames">
+      <div class="frames-head">
+        <div id="framesSummary" class="summary"></div>
+        <label class="small">Rejection sensitivity <input id="sensSlider" type="range" min="0.5" max="2" step="0.1" value="1"> <output id="sensOut">1.0</output></label>
+      </div>
+      <div class="charts" id="charts"></div>
+      <div class="frames-body">
+        <div class="tablewrap">
+          <table id="framesTable">
+            <thead><tr>
+              <th data-k="idx">#</th><th data-k="name">Frame</th><th data-k="accepted">Use</th><th data-k="fwhm">FWHM</th><th data-k="elongation">Elong.</th><th data-k="n_stars">Stars</th><th data-k="transparency">Transp.</th><th data-k="obstructed">Masked</th><th data-k="background">Sky</th><th data-k="weight">Weight</th><th>Notes</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="framepreview" id="framePreview">
+          <p class="muted small">Hover a row to preview the frame. Click “Use” to override the automatic decision.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- EXPORT -->
+    <section class="tabpane" id="tab-export">
+      <div class="export-grid">
+        <div class="card">
+          <h3>Export settings</h3>
+          <label>JPEG quality <input id="ex-quality" type="range" min="80" max="100" value="95"><output>95</output></label>
+          <label>Upscale <select id="ex-upscale"><option value="1">1× (native)</option><option value="1.5">1.5× Lanczos</option><option value="2">2× Lanczos</option></select></label>
+          <label class="check"><input id="ex-tiff" type="checkbox" checked> Also write 16-bit TIFF</label>
+          <button class="btn primary wide" id="exportBtn2">Export full-resolution image</button>
+          <p class="muted small">The export renders every step at full resolution with the current Process settings (a JSON sidecar records them).</p>
+        </div>
+        <div class="card grow">
+          <h3>Exports</h3>
+          <div id="exportsList" class="exports"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- DIAGNOSTICS -->
+    <section class="tabpane" id="tab-diag">
+      <div class="diag-grid">
+        <figure><img id="diagRef" alt=""><figcaption>Reference frame (auto-selected)</figcaption></figure>
+        <figure><img id="diagCov" alt=""><figcaption>Integration coverage (frames × weights)</figcaption></figure>
+        <figure><img id="diagRej" alt=""><figcaption>Pixel rejection map (satellites, planes, cosmic rays)</figcaption></figure>
+        <div class="card"><h3>Stack &amp; processing info</h3><pre id="diagInfo" class="small"></pre></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

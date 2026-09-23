@@ -1,0 +1,17 @@
+# Core numerics / astronomy
+numpy>=2.0
+scipy>=1.13
+astropy>=6.0
+sep>=1.4
+astroalign>=2.5
+scikit-image>=0.24
+scikit-learn>=1.5
+opencv-python-headless>=4.10
+pillow>=10.0
+tifffile>=2024.1
+# ML denoiser (install the CUDA build on NVIDIA machines — see README)
+torch>=2.3
+# Web UI
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
