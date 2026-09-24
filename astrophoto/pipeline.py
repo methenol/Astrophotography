@@ -260,7 +260,7 @@ class Session:
             info0 = self.infos[0]
             for k, v in {"OBJECT": info0.object, "FILTER": info0.filter, "NFRAMES": out["n_frames"],
                          "TOTEXP": out["total_exposure"], "STKMODE": out["mode"], "STKSCALE": out["scale"],
-                         "CREATOR": f"AstroPipe {__version__}", "BAYERPAT": info0.bayer}.items():
+                         "CREATOR": f"AstroPhoto Studio {__version__}", "BAYERPAT": info0.bayer}.items():
                 hdr[k] = v
             _save_fits(self._p("stack.fits"), out["stack"], hdr)
             _save_fits(self._p("half_a.fits"), out["half_a"])
@@ -355,10 +355,10 @@ class Session:
         base = self._p(f"exports/{obj}_{stamp}")
         im8 = Image.fromarray((img * 255 + 0.5).astype(np.uint8))
         desc = (f"{self.meta.get('object', '')} | {self.meta.get('n_frames')} x subs, "
-                f"{self.meta.get('total_exposure', 0) / 60:.1f} min | AstroPipe {__version__}")
+                f"{self.meta.get('total_exposure', 0) / 60:.1f} min | AstroPhoto Studio {__version__}")
         exif = Image.Exif()
         exif[0x010E] = desc  # ImageDescription
-        exif[0x0131] = f"AstroPipe {__version__}"  # Software
+        exif[0x0131] = f"AstroPhoto Studio {__version__}"  # Software
         im8.save(base + ".jpg", quality=int(quality), subsampling=0, optimize=True, exif=exif)
         files = {"jpg": base + ".jpg"}
         if tiff:

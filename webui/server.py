@@ -1,4 +1,4 @@
-"""AstroPipe web UI (FastAPI).
+"""AstroPhoto Studio web UI (FastAPI).
 
     python -m webui.server            # http://127.0.0.1:8000
     python -m webui.server --host 0.0.0.0 --port 8080 --images /path/to/seestar/exports
@@ -30,7 +30,7 @@ from astropipe.pipeline import DEFAULTS, STACK_DEFAULTS, Cancelled, Session, cle
 
 CONFIG = {"images": os.path.join(ROOT, "images"), "workdir": os.path.join(ROOT, "output")}
 
-app = FastAPI(title="AstroPipe", version=__version__)
+app = FastAPI(title="AstroPhoto Studio", version=__version__)
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -365,7 +365,7 @@ def main():
     CONFIG["images"] = os.path.abspath(a.images)
     CONFIG["workdir"] = os.path.abspath(a.workdir)
     import uvicorn
-    print(f"AstroPipe {__version__} web UI -> http://{a.host}:{a.port}")
+    print(f"AstroPhoto Studio {__version__} web UI -> http://{a.host}:{a.port}")
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")
 
 

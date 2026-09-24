@@ -1,4 +1,4 @@
-/* AstroPipe Studio front-end (vanilla JS, no build step) */
+/* AstroPhoto Studio front-end (vanilla JS, no build step) */
 const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const store = {

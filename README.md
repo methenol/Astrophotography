@@ -1,4 +1,4 @@
-# AstroPipe — Seestar raw FITS → finished astrophoto
+# AstroPhoto Studio — Seestar raw FITS → finished astrophoto
 
 An end-to-end pipeline that turns the raw `.fit` subs saved by a ZWO Seestar
 (S50 / S50 Pro / S30) into a finished image. It

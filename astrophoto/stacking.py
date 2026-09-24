@@ -230,7 +230,7 @@ class Integrator:
         if idx not in self.offsets:
             sub = vals[::8, ::8][valid[::8, ::8]]
             self.offsets[idx] = np.median(sub, axis=0) if len(sub) else np.zeros(3, np.float32)
-        vals = vals - (self.offsets[idx] - self.ref_level)[None, None, :]
+        vals -= (self.offsets[idx] - self.ref_level).astype(np.float32)[None, None, :]
         if use_gradient and idx in self.gradients:
             vals -= eval_surface(self.gradients[idx], self.H, self.W)
         return vals, valid
@@ -246,6 +246,9 @@ class Integrator:
         self.ref_level = np.median(v[::8, ::8][valid[::8, ::8]], axis=0).astype(np.float32)
         del v, w_
 
+        # All per-frame arithmetic below is done in place on the frame's own buffers:
+        # at 2x super-resolution every full-size temporary is ~400 MB.
+
         # ---- pass 1: weighted mean
         S = np.zeros((H, W, 3), np.float32)
         Wt = np.zeros((H, W, 3), np.float32)
@@ -253,11 +256,13 @@ class Integrator:
             if self.cancel():
                 raise RuntimeError("cancelled")
             vals, _ = self._normalise(k, vals, wts, False)
-            ww = wts * fw
-            S += vals * ww
-            Wt += ww
+            wts *= np.float32(fw)
+            Wt += wts
+            vals *= wts
+            S += vals
             self.progress(k + 1, n, f"Integration pass 1/3 ({k + 1}/{n})")
-        mu1 = S / np.maximum(Wt, 1e-6)
+        mu1 = S
+        mu1 /= np.maximum(Wt, 1e-6)
         del S
 
         # ---- pass 2: local normalisation + mean/variance
@@ -268,59 +273,79 @@ class Integrator:
             if self.cancel():
                 raise RuntimeError("cancelled")
             vals, valid = self._normalise(k, vals, wts, False)
+            vals -= mu1                                  # vals is now d = x - mu1
             if self.local_norm:
-                self.gradients[k] = fit_smooth_surface(vals - mu1, valid, deg=2)
+                self.gradients[k] = fit_smooth_surface(vals, valid, deg=2)
                 vals -= eval_surface(self.gradients[k], H, W)
-            d = vals - mu1
-            ww = wts * fw
-            S1 += d * ww
-            S2 += d * d * ww
-            Wt += ww
+            wts *= np.float32(fw)
+            Wt += wts
+            vals *= wts                                  # w*d
+            S1 += vals
+            vals *= vals                                 # w^2 d^2 ...
+            vals /= np.maximum(wts, np.float32(1e-12))   # ... -> w d^2
+            S2 += vals
             self.progress(k + 1, n, f"Integration pass 2/3 ({k + 1}/{n})")
         Wsafe = np.maximum(Wt, 1e-6)
-        m = S1 / Wsafe
-        mu2 = mu1 + m
-        sd = np.sqrt(np.maximum(S2 / Wsafe - m * m, 0))
-        del S1, S2, m, mu1
+        S1 /= Wsafe
+        mu2 = mu1
+        mu2 += S1
+        S2 /= Wsafe
+        S1 *= S1
+        S2 -= S1
+        np.maximum(S2, 0, out=S2)
+        sd = np.sqrt(S2, out=S2)
+        del S1, Wsafe
+        coverage = Wt[..., 1] / max(float(Wt[..., 1].max()), 1e-6)
+        del Wt
         # robust floor for the clipping scale (few-frame pixels at the edges)
-        sd_floor = np.median(sd[sd > 0]) * 0.25 if (sd > 0).any() else 1.0
-        sd = np.maximum(sd, sd_floor)
+        pos = sd[::4, ::4][sd[::4, ::4] > 0]
+        sd_floor = float(np.median(pos)) * 0.25 if pos.size else 1.0
+        np.maximum(sd, sd_floor, out=sd)
 
         # ---- pass 3: sigma-clipped integration into two half stacks
         SA = np.zeros((H, W, 3), np.float32)
         WA = np.zeros((H, W, 3), np.float32)
         SB = np.zeros((H, W, 3), np.float32)
         WB = np.zeros((H, W, 3), np.float32)
-        rejected = np.zeros((H, W), np.float32)
+        rejected = np.zeros((H, W), np.uint16)
         clip = n >= 5
+        r = np.empty((H, W, 3), np.float32)
         for k, (vals, wts, fw) in enumerate(_bounded_map(self._warp, range(n), self.workers)):
             if self.cancel():
                 raise RuntimeError("cancelled")
             vals, valid = self._normalise(k, vals, wts, True)
-            ww = wts * fw
+            wts *= np.float32(fw)
             if clip:
-                r = (vals - mu2) / sd
-                bad = (r > self.sigma_high) | (r < -self.sigma_low)
-                ww = np.where(bad, 0, ww)
+                np.subtract(vals, mu2, out=r)
+                r /= sd
+                bad = r > self.sigma_high
+                bad |= r < -self.sigma_low
+                wts[bad] = 0
                 rejected += bad.any(-1) & valid
-            if k % 2 == 0:
-                SA += vals * ww
-                WA += ww
-            else:
-                SB += vals * ww
-                WB += ww
+            acc_s, acc_w = (SA, WA) if k % 2 == 0 else (SB, WB)
+            acc_w += wts
+            vals *= wts
+            acc_s += vals
             self.progress(k + 1, n, f"Integration pass 3/3 ({k + 1}/{n})")
+        del r, sd
         Wtot = WA + WB
-        full = np.where(Wtot > 0, (SA + SB) / np.maximum(Wtot, 1e-6), mu2)
-        half_a = np.where(WA > 0, SA / np.maximum(WA, 1e-6), full)
-        half_b = np.where(WB > 0, SB / np.maximum(WB, 1e-6), full)
-        coverage = Wt[..., 1] / max(Wt[..., 1].max(), 1e-6)
+        full = SA + SB
+        full /= np.maximum(Wtot, 1e-6)
+        np.copyto(full, mu2, where=Wtot <= 0)
+        del Wtot, mu2
+        half_a = SA
+        half_a /= np.maximum(WA, 1e-6)
+        np.copyto(half_a, full, where=WA <= 0)
+        half_b = SB
+        half_b /= np.maximum(WB, 1e-6)
+        np.copyto(half_b, full, where=WB <= 0)
+        del WA, WB
         return {
-            "stack": full.astype(np.float32),
-            "half_a": half_a.astype(np.float32),
-            "half_b": half_b.astype(np.float32),
+            "stack": full,
+            "half_a": half_a,
+            "half_b": half_b,
             "coverage": coverage.astype(np.float32),
-            "rejected_frac": (rejected / n).astype(np.float32),
+            "rejected_frac": (rejected.astype(np.float32) / n),
             "mode": self.mode,
             "scale": self.scale,
             "n_frames": n,

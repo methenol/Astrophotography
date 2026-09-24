@@ -1,4 +1,4 @@
-"""AstroPipe: an end-to-end astrophotography pipeline for ZWO Seestar raw FITS subs.
+"""AstroPhoto Studio: an end-to-end astrophotography pipeline for ZWO Seestar raw FITS subs.
 
 Stages
 ------
