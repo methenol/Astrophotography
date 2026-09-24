@@ -1,9 +1,9 @@
 """Command line interface.
 
-    python -m astropipe run "images/IC 5070_sub"            # full pipeline -> JPG/TIFF
-    python -m astropipe run DIR --device cuda --scale 1.5 --palette hoo
-    python -m astropipe analyse DIR                           # frame quality report only
-    python -m astropipe devices                               # list GPUs
+    python -m astrophoto run "images/IC 5070_sub"            # full pipeline -> JPG/TIFF
+    python -m astrophoto run DIR --device cuda --scale 1.5 --palette hoo
+    python -m astrophoto analyse DIR                           # frame quality report only
+    python -m astrophoto devices                               # list GPUs
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def _progress():
 def main(argv=None):
     from .pipeline import DEFAULTS, STACK_DEFAULTS, Session
 
-    ap = argparse.ArgumentParser(prog="astropipe", description="Seestar astrophotography pipeline")
+    ap = argparse.ArgumentParser(prog="astrophoto", description="Seestar astrophotography pipeline")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="analyse, stack, denoise, process and export")
     r.add_argument("folder")

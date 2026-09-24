@@ -83,6 +83,15 @@ def _json_default(o):
     return str(o)
 
 
+class _CompatUnpickler(pickle.Unpickler):
+    """Load caches written before the package was renamed astropipe -> astrophoto."""
+
+    def find_class(self, module, name):
+        if module == "astropipe" or module.startswith("astropipe."):
+            module = "astrophoto" + module[len("astropipe"):]
+        return super().find_class(module, name)
+
+
 class Cancelled(Exception):
     pass
 
@@ -113,7 +122,7 @@ class Session:
         if os.path.exists(self._p("analysis.pkl")):
             try:
                 with open(self._p("analysis.pkl"), "rb") as f:
-                    st = pickle.load(f)
+                    st = _CompatUnpickler(f).load()
                 self.infos, self.analysis, self.overrides = st["infos"], st["analysis"], st.get("overrides", {})
                 if os.path.exists(self._p("defects.npy")):
                     self.defects = np.load(self._p("defects.npy"))

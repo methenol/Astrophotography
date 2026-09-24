@@ -23,10 +23,10 @@ pip install -r requirements.txt          # or: uv pip install -r requirements.tx
 python -m webui.server                   # --images /path/to/Seestar/MyWorks  --port 8080  --host 0.0.0.0
 
 # or headless, one command:
-python -m astropipe run "images/IC 5070_sub"
-python -m astropipe run DIR --palette hoo --saturation 1.8 --scale 1.5 --upscale 2 --device cuda
-python -m astropipe analyse DIR          # just the frame-quality report
-python -m astropipe devices              # show GPUs PyTorch can use
+python -m astrophoto run "images/IC 5070_sub"
+python -m astrophoto run DIR --palette hoo --saturation 1.8 --scale 1.5 --upscale 2 --device cuda
+python -m astrophoto analyse DIR          # just the frame-quality report
+python -m astrophoto devices              # show GPUs PyTorch can use
 ```
 
 Point the UI or CLI at any folder of Seestar subs, for example the
@@ -44,13 +44,13 @@ PyTorch wheel on Windows/Linux is often CPU-only, so install the CUDA build:
 python -m venv .venv && .venv\Scripts\activate      # Windows  (Linux: source .venv/bin/activate)
 pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
-python -m astropipe devices          # should list your RTX card
+python -m astrophoto devices          # should list your RTX card
 ```
 
 On CUDA the denoiser uses mixed precision (bf16 on RTX 30/40/50, fp16 on
 older cards). It sizes the training batch and the inference tiles to the
 card's VRAM: 8 GB cards work fine, and 4–6 GB cards use smaller tiles. Pick a
-specific GPU with `--device cuda:1`, or with `ASTROPIPE_DEVICE=cuda:1`. The
+specific GPU with `--device cuda:1`, or with `ASTROPHOTO_DEVICE=cuda:1`. The
 UI also has a device selector. Everything outside the denoiser (NumPy,
 OpenCV, SEP) runs on the CPU and is platform-independent.
 
@@ -90,7 +90,7 @@ The deconvolution stage then works on the finer grid.
 
 Costs: about 4× the stacking time and 4× larger stack and export files. It needs roughly 50+ subs to
 fill the finer grid evenly. Stacking parallelism is limited automatically to fit about 3 GB of RAM;
-raise it with `ASTROPIPE_STACK_RAM_GB=6` on bigger machines. The export **Upscale** option is only
+raise it with `ASTROPHOTO_STACK_RAM_GB=6` on bigger machines. The export **Upscale** option is only
 interpolation. Use Super-resolution for real detail.
 
 ## Tips

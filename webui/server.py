@@ -25,8 +25,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-from astropipe import __version__  # noqa: E402
-from astropipe.pipeline import DEFAULTS, STACK_DEFAULTS, Cancelled, Session, clean_json, slugify  # noqa: E402
+from astrophoto import __version__  # noqa: E402
+from astrophoto.pipeline import DEFAULTS, STACK_DEFAULTS, Cancelled, Session, clean_json, slugify  # noqa: E402
 
 CONFIG = {"images": os.path.join(ROOT, "images"), "workdir": os.path.join(ROOT, "output")}
 
@@ -106,7 +106,7 @@ def index():
 @app.get("/api/system")
 def system():
     try:
-        from astropipe.denoise import device_info
+        from astrophoto.denoise import device_info
         dev = device_info()
     except Exception as e:  # torch missing
         dev = {"default": "cpu", "gpus": [], "error": str(e)}
@@ -325,7 +325,7 @@ def diagnostic(folder: str, kind: str):
         return FileResponse(f, media_type="image/jpeg")
     if not p or not os.path.exists(os.path.join(s.dir, p)):
         raise HTTPException(404)
-    from astropipe.pipeline import _load_fits
+    from astrophoto.pipeline import _load_fits
     m = _load_fits(os.path.join(s.dir, p))
     m = m / max(np.percentile(m, 99.9), 1e-6)
     m = cv2.resize(m, None, fx=min(1, 900 / max(m.shape)), fy=min(1, 900 / max(m.shape)), interpolation=cv2.INTER_AREA)

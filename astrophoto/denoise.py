@@ -24,12 +24,12 @@ def pick_device(preference: str = "auto") -> torch.device:
     """Choose a compute device: NVIDIA CUDA, Apple Metal (MPS) or CPU.
 
     ``preference`` may be "auto", "cuda", "cuda:1", "mps" or "cpu".  The
-    ``ASTROPIPE_DEVICE`` environment variable overrides "auto".
+    ``ASTROPHOTO_DEVICE`` environment variable overrides "auto".
     """
     import os
     pref = (preference or "auto").lower()
     if pref == "auto":
-        pref = os.environ.get("ASTROPIPE_DEVICE", "auto").lower()
+        pref = os.environ.get("ASTROPHOTO_DEVICE", "auto").lower()
     if pref.startswith("cuda") and torch.cuda.is_available():
         return torch.device(pref)
     if pref == "mps" and torch.backends.mps.is_available():

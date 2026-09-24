@@ -131,7 +131,7 @@ class Integrator:
         # each in-flight frame holds values+weights at output resolution; keep RAM bounded
         # (values + weights + warp temporaries ~ 2.5x a frame), bounded by a RAM budget
         frame_gb = self.W * self.H * 3 * 4 * 2 * 2.5 / 2**30
-        budget_gb = float(os.environ.get("ASTROPIPE_STACK_RAM_GB", 3.0))
+        budget_gb = float(os.environ.get("ASTROPHOTO_STACK_RAM_GB", 3.0))
         self.workers = workers or int(max(1, min(6, (os.cpu_count() or 4) // 2, budget_gb // max(frame_gb, 0.05))))
         self.progress = progress or (lambda *a: None)
         self.cancel = cancel or (lambda: False)
