@@ -129,8 +129,10 @@ class Integrator:
         self.sigma_low, self.sigma_high = sigma_low, sigma_high
         self.local_norm = local_norm and len(self.items) >= 3
         # each in-flight frame holds values+weights at output resolution; keep RAM bounded
-        frame_gb = self.W * self.H * 3 * 4 * 2 / 2**30
-        self.workers = workers or int(max(1, min(6, (os.cpu_count() or 4) // 2, 3.0 // max(frame_gb, 0.05))))
+        # (values + weights + warp temporaries ~ 2.5x a frame), bounded by a RAM budget
+        frame_gb = self.W * self.H * 3 * 4 * 2 * 2.5 / 2**30
+        budget_gb = float(os.environ.get("ASTROPIPE_STACK_RAM_GB", 3.0))
+        self.workers = workers or int(max(1, min(6, (os.cpu_count() or 4) // 2, budget_gb // max(frame_gb, 0.05))))
         self.progress = progress or (lambda *a: None)
         self.cancel = cancel or (lambda: False)
         self.grid = analysis["grid"]
@@ -146,10 +148,10 @@ class Integrator:
         size = (self.W, self.H)
         maps = self._distortion_maps(fr)
         if maps is not None:
-            mx, my = maps
+            m1, m2 = maps
 
             def warp(img, interp):
-                return cv2.remap(img, mx, my, interp, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                return cv2.remap(img, m1, m2, interp, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         else:
             M = _scaled_transform(fr["transform"], self.scale)
 
@@ -157,18 +159,18 @@ class Integrator:
                 return cv2.warpAffine(img, M, size, flags=interp, borderValue=0)
         ones = np.ones((self.H0, self.W0), np.float32)
         if self.mode == "drizzle":
-            vals = np.empty((self.H, self.W, 3), np.float32)
-            wts = np.empty((self.H, self.W, 3), np.float32)
-            for c in range(3):
-                m = self._masks[..., c]
-                num = warp(raw * m, cv2.INTER_LINEAR)
-                den = warp(m, cv2.INTER_LINEAR)
-                ok = den > 1e-3
-                vals[..., c] = np.where(ok, num / np.maximum(den, 1e-3), 0)
-                wts[..., c] = np.where(ok, den, 0)
-            # a pixel only counts where the frame fully covers it (avoid ragged edges)
-            cov = warp(ones, cv2.INTER_LINEAR) > 0.999
-            wts *= cov[..., None]
+            # all three colours in two 3-channel warps: sparse samples and their masks
+            num = warp(raw[..., None] * self._masks, cv2.INTER_LINEAR)
+            den = warp(self._masks, cv2.INTER_LINEAR)
+            # the masks sum to one, so their warped sum is the frame's footprint;
+            # a pixel only counts where the frame fully covers it (no ragged edges)
+            cov = den.sum(-1) > 0.999
+            ok = (den > 1e-3) & cov[..., None]
+            # in place: values where the weight is zero are never used (weight 0)
+            vals = num
+            np.divide(num, np.maximum(den, np.float32(1e-3)), out=vals)
+            wts = den
+            wts *= ok
         else:
             rgb = demosaic(raw, self.pattern)
             vals = warp(rgb, cv2.INTER_LANCZOS4)
@@ -199,11 +201,16 @@ class Integrator:
         from .analysis import poly_terms
         A = np.vstack([np.asarray(fr["transform"], np.float64), [0, 0, 1]])
         Ai = np.linalg.inv(A)[:2]
-        # reference-pixel coordinates of every output pixel centre (separable)
-        rx = (np.arange(self.W, dtype=np.float64) + 0.5) / self.scale - 0.5
-        ry = (np.arange(self.H, dtype=np.float64) + 0.5) / self.scale - 0.5
-        mx = (Ai[0, 0] * rx[None, :] + Ai[0, 1] * ry[:, None] + Ai[0, 2]).astype(np.float32)
-        my = (Ai[1, 0] * rx[None, :] + Ai[1, 1] * ry[:, None] + Ai[1, 2]).astype(np.float32)
+        # reference-pixel coordinates of every output pixel centre (separable, float32,
+        # built with in-place broadcasting – no full-size float64 temporaries)
+        rx = ((np.arange(self.W, dtype=np.float64) + 0.5) / self.scale - 0.5)
+        ry = ((np.arange(self.H, dtype=np.float64) + 0.5) / self.scale - 0.5)
+        mx = np.empty((self.H, self.W), np.float32)
+        my = np.empty((self.H, self.W), np.float32)
+        mx[:] = (Ai[0, 0] * rx + Ai[0, 2]).astype(np.float32)[None, :]
+        mx += (Ai[0, 1] * ry).astype(np.float32)[:, None]
+        my[:] = (Ai[1, 0] * rx + Ai[1, 2]).astype(np.float32)[None, :]
+        my += (Ai[1, 1] * ry).astype(np.float32)[:, None]
         # residual on a coarse grid whose cells line up with cv2.resize's pixel-centre convention
         gh, gw = max(4, self.H // 32), max(4, self.W // 32)
         cy = (np.arange(gh) + 0.5) * self.H / gh - 0.5
@@ -213,9 +220,10 @@ class Integrator:
         px, py = T @ dist["coefs"][0], T @ dist["coefs"][1]
         sx = Ai[0, 0] * gx + Ai[0, 1] * gy + Ai[0, 2]
         sy = Ai[1, 0] * gx + Ai[1, 1] * gy + Ai[1, 2]
-        dx = cv2.resize((px - sx).astype(np.float32), (self.W, self.H), interpolation=cv2.INTER_LINEAR)
-        dy = cv2.resize((py - sy).astype(np.float32), (self.W, self.H), interpolation=cv2.INTER_LINEAR)
-        return mx + dx, my + dy
+        mx += cv2.resize((px - sx).astype(np.float32), (self.W, self.H), interpolation=cv2.INTER_LINEAR)
+        my += cv2.resize((py - sy).astype(np.float32), (self.W, self.H), interpolation=cv2.INTER_LINEAR)
+        # fixed-point maps make cv2.remap considerably faster
+        return cv2.convertMaps(mx, my, cv2.CV_16SC2)
 
     def _normalise(self, idx, vals, wts, use_gradient: bool):
         valid = wts[..., 1] > 0

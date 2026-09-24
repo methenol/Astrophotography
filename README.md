@@ -75,6 +75,24 @@ OpenCV, SEP) runs on the CPU and is platform-independent.
 | **Narrowband (LP filter)** | Ha comes from the red pixels and OIII from the green and blue pixels. Ha **leakage into OIII is estimated from the data** (lower envelope of OIII/Ha over high-SNR Ha pixels) and removed. OIII is then linearly fitted to Ha, both are stretched with one curve, and they are combined as **Foraxx** (dynamic), HOO or warm HOO. **Synthetic luminance** (LRGB-style) takes lightness from the best-SNR all-channel stretch, so red-dominant Ha regions keep their full brightness. |
 | **Finishing** | Post-stretch starlet shrinkage on luminance, OKLab chroma noise reduction, wavelet local contrast, perceptual (OKLab) vibrance with background protection, SCNR, curves and masked sharpening. |
 
+## Super-resolution
+
+Every Seestar sub lands on the sky slightly shifted and rotated (tracking drift and alt-az
+field rotation), so a stack samples the sky on a finer grid than any single frame. With
+**Super-resolution 1.5× / 2×** (web UI: *Integration & compute options*; CLI: `--scale 2`),
+the Bayer-drizzle integrator resamples every colour sample straight onto the finer grid.
+There is no demosaic step and no invented detail: the extra resolution comes from the data.
+
+Measured on 100 subs of M 27: star FWHM went from **7.7″ at 1× to 6.5″ at 2×**, about 16% sharper,
+with better colour resolution because each colour channel is sampled directly. At 2× the pixel scale
+(1.15″/px) already samples the seeing-limited stars properly, so going beyond 2× gains nothing.
+The deconvolution stage then works on the finer grid.
+
+Costs: about 4× the stacking time and 4× larger stack and export files. It needs roughly 50+ subs to
+fill the finer grid evenly. Stacking parallelism is limited automatically to fit about 3 GB of RAM;
+raise it with `ASTROPIPE_STACK_RAM_GB=6` on bigger machines. The export **Upscale** option is only
+interpolation. Use Super-resolution for real detail.
+
 ## Tips
 
 - **Presets** in the Process tab are starting points: *Balanced*, *Vivid nebula*,
