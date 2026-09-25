@@ -64,11 +64,11 @@ OpenCV, SEP) runs on the CPU and is platform-independent.
 | **Cloud / obstruction detection** | Reference-star photometry: each bright reference star that should appear in a frame is looked up, and the flux ratio is aggregated on a tile grid. Tiles whose stars dim or vanish (a tree, a roof, a passing cloud) become per-frame masks, so a partly blocked frame still contributes its clean area. |
 | **Rejection & weighting** | Robust median/MAD tests on each metric, plus an unsupervised **Isolation Forest** over the multivariate metrics. Weights are signal²/noise² × sharpness. Sensitivity is adjustable, and each frame can be overridden in the UI. |
 | **Integration** | Streaming three-pass integration with bounded memory (hundreds of subs fit in 16 GB of RAM). **Local normalisation** removes each frame's rotating gradient against the running mean. Weighted **sigma clipping** removes satellites, planes and cosmic rays. **Bayer drizzle** resamples each colour's samples directly, with no demosaic interpolation. Optional 1.5× or 2× output uses the dithering and rotation between frames. Frames alternate between two independent **half stacks**. |
-| **AI denoise** | **Noise2Noise**: a U-Net is trained *on your own data* to map half-stack A to half-stack B. Because the noise in the two is independent, the network learns the expected clean signal for this exact sensor, sky and integration. It uses no pretrained weights, so it can't invent detail from other people's images. Training runs in a variance-stabilised (asinh) domain, and bright star cores are handed back unchanged. |
+| **AI denoise** | **Noise2Noise**: a U-Net is trained *on your own data* to map half-stack A to half-stack B. Because the noise in the two is independent, the network learns the expected clean signal for this exact sensor, sky and integration. It uses no pretrained weights, so it can't invent detail from other people's images. Training runs in a variance-stabilised (asinh) domain, inference averages 8 rotations/flips (self-ensemble), and bright star cores are handed back unchanged. |
 | **Gradient removal** | Tile samples with stars masked. An iterative *lower-envelope* surface fit (polynomial or thin-plate RBF) rejects samples sitting on nebulosity or galaxies. When nebulosity dominates the field, the model order is reduced automatically. |
 | **Crop** | Largest fully covered rectangle, found by an aspect-ratio search on the coverage map and centred on the deepest part of the stack. The minimum coverage is adjustable. |
-| **Colour** | Background neutralisation and star-based white balance (aperture photometry of unsaturated stars). Pixels clipped in any channel are rendered neutral. Without this, white-balance gains turn saturated cores blue or purple. |
-| **Deconvolution** | Richardson–Lucy with a **PSF measured from your stars** (median of sub-pixel re-centred isolated stars), with total-variation regularisation, deringing, SNR masking and protection for saturated cores. |
+| **Colour** | Background neutralisation and star-based white balance: aperture photometry of isolated, unsaturated stars, with the aperture sized to the *widest* colour channel. When AI deconvolution is available, the stars are measured on the deconvolved image, where each channel's halo light is back in the core. Refractors spread blue light into a wider halo, and small apertures miss it; that used to over-boost blue and gave galaxies a pink or magenta cast. Pixels clipped in any channel are rendered neutral, because white-balance gains would otherwise turn saturated cores blue or purple. |
+| **AI deconvolution** | A second network is trained on the same half-stack pairs to *undo the blur*. This is a Noise2Noise adaptation of ZS-DeconvNet. The network takes the denoised half A. Its output, blurred by **PSFs measured from your own stars (one per colour channel)**, must predict the raw half B (χ² with the measured per-pixel noise). The only way to lower that loss is to recover the true, sharper sky. A Hessian penalty and a physical **sky-floor prior** (no flux below the local sky) prevent the dark rings and noise that classic deconvolution produces. In held-out tests on M 27, IC 5070 and M 31, star FWHM fell by 2–2.5× with no ringing, against 1.1× for the old masked Richardson–Lucy (see `experiments/README.md`). Saturated stars are handed back to the denoised image. Richardson–Lucy with TV regularisation remains as the fallback when too few stars are available. |
 | **Star separation** | Stars are detected on a background mesh scaled to the PSF, so stars on galaxy discs separate cleanly. A concentration index keeps galaxy nuclei, M32/M110-type companions and nebula knots out of the star layer. Mask radii come from each star's measured per-channel radial profile, and push-pull inpainting with matched grain fills the gaps. |
 | **Star colour & halos** | Refractors bring blue/violet (and the OIII band) to a slightly different focus, so bright stars get coloured rings. Halo light above the local background is desaturated in linear data. The star layer uses a luminance-only stretch, true linear star colour and an "unscreen" recombination, which gives white cores with no coloured blooming, dark donuts or tints over bright backgrounds. |
 | **Stretch** | **Generalized Hyperbolic Stretch**. Its strength is solved automatically so that the starless background lands on a target level. It is colour-preserving, with luminance-preserving gamut mapping so that saturated highlights never darken. |
@@ -93,6 +93,15 @@ fill the finer grid evenly. Stacking parallelism is limited automatically to fit
 raise it with `ASTROPHOTO_STACK_RAM_GB=6` on bigger machines. The export **Upscale** option is only
 interpolation. Use Super-resolution for real detail.
 
+## Research & benchmarks
+
+`experiments/` holds the harness used to choose the ML models. It scores every
+denoiser and deconvolver on held-out data against the independent half-stack, so
+no ground truth is needed. It covers U-Net variants, NAFNet, ZS-N2N,
+non-local means, Richardson–Lucy, DPIR plug-and-play and the N2N deconvolution
+network. The results and the arXiv papers behind each choice are in
+[experiments/README.md](experiments/README.md).
+
 ## Tips
 
 - **Presets** in the Process tab are starting points: *Balanced*, *Vivid nebula*,
@@ -100,7 +109,7 @@ interpolation. Use Super-resolution for real detail.
 - Processing sliders re-render a fast preview in about a second. The heavy
   stages (analysis, stacking, denoise) only re-run when you press their buttons.
 - If you change frame selection or sensitivity in the Frames tab, run
-  **Register & integrate** again, then **AI denoise**.
+  **Register & integrate** again, then **AI denoise & deconvolve**.
 - For very short sessions (fewer than about 15 subs) the stacker switches from
   drizzle to demosaic automatically. The denoiser still works, but has less to learn from.
 - Export writes a JSON sidecar with every parameter, so a result can be reproduced.

@@ -2,5 +2,9 @@
 images/
 .DS_Store
 output/
+final/
 __pycache__/
 *.pyc
+
+# experiment caches
+experiments/cache/

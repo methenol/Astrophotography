@@ -156,6 +156,7 @@ function stackParams() {
     mode: g("mode").value, scale: parseFloat(g("scale").value), sensitivity: parseFloat(g("sensitivity").value),
     sigma_low: parseFloat(g("sigma_low").value), sigma_high: parseFloat(g("sigma_high").value),
     local_norm: g("local_norm").checked, denoise_iters: parseInt(g("denoise_iters").value), device: g("device").value,
+    ai_deconvolution: g("ai_deconvolution").checked,
   };
 }
 function exportOpts() {

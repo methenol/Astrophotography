@@ -44,6 +44,8 @@ def main(argv=None):
     r.add_argument("--sensitivity", type=float, default=STACK_DEFAULTS["sensitivity"])
     r.add_argument("--device", default="auto", help="auto | cuda | cuda:N | mps | cpu")
     r.add_argument("--denoise-iters", type=int, default=STACK_DEFAULTS["denoise_iters"])
+    r.add_argument("--no-ai-deconv", action="store_true",
+                   help="skip the self-supervised deconvolution network (use Richardson-Lucy instead)")
     r.add_argument("--quality", type=int, default=95)
     r.add_argument("--upscale", type=float, default=1.0)
     r.add_argument("--params", help="JSON file or string with processing parameters")
@@ -88,7 +90,8 @@ def main(argv=None):
         if v is not None:
             proc[k] = v
     stack = {"mode": args.mode, "scale": args.scale, "sensitivity": args.sensitivity,
-             "device": args.device, "denoise_iters": args.denoise_iters}
+             "device": args.device, "denoise_iters": args.denoise_iters,
+             "ai_deconvolution": not args.no_ai_deconv}
     files = s.run_all(stack, proc, progress=_progress(), quality=args.quality, upscale=args.upscale)
     print(json.dumps(files, indent=2))
 

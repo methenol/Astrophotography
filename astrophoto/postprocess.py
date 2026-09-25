@@ -2,8 +2,8 @@
 
 Linear stage (full resolution, cached):
     auto-crop -> gradient/background extraction -> background neutralisation
-    -> star-based white balance -> ML denoise blend -> PSF-measured
-    Richardson-Lucy deconvolution (TV-regularised, deringed)
+    -> star-based white balance -> ML denoise blend -> self-supervised
+    deconvolution network blend (or PSF-measured Richardson-Lucy fallback)
 Non-linear stage (fast; runs on a preview scale or full resolution):
     star separation (mask + inpainting) -> auto-solved Generalized Hyperbolic
     Stretch -> narrowband palette (HOO / Foraxx dynamic) or colour-preserving
@@ -27,7 +27,7 @@ DEFAULTS = {
     "bg_degree": 2,
     "white_balance": "stars",   # stars | background | none
     "denoise": 0.95,            # blend with Noise2Noise result (0..1)
-    "deconvolution": 0.5,       # 0..1 strength
+    "deconvolution": 0.7,       # 0..1 strength (AI deconvolution blend, or Richardson-Lucy fallback)
     # non-linear stage
     "palette": "auto",          # auto | natural | hoo | foraxx | hoo_warm
     "oiii_boost": 1.0,
@@ -306,12 +306,27 @@ def measure_star_colors(img: np.ndarray, sat: float) -> np.ndarray | None:
     objs = objs[ok]
     if len(objs) < 10:
         return None
-    r = 3.0 * np.median(objs["a"]) + 1
-    fl = []
+    # The aperture must hold the whole star in EVERY channel: refractors focus colours
+    # differently (blue/violet halos), so an aperture sized to the luminance core
+    # under-measures the widest channel and the white balance over-boosts it.
+    subs = []
+    r50 = []
     for c in range(3):
         ch = np.ascontiguousarray(img[..., c])
-        b = sep.Background(ch, bw=64, bh=64)
-        f, _, _ = sep.sum_circle(ch - b.back(), objs["x"], objs["y"], r, bkgann=(r + 3, r + 8))
+        sub = ch - sep.Background(ch, bw=64, bh=64).back()
+        subs.append(sub)
+        rr, _ = sep.flux_radius(sub, objs["x"], objs["y"], 6.0 * objs["a"], 0.5, subpix=5)
+        r50.append(np.nanmedian(rr[np.isfinite(rr) & (rr > 0)]) if np.isfinite(rr).any() else np.nan)
+    r = float(np.clip(5.0 * np.nanmax(r50), 3.0 * np.median(objs["a"]) + 1, 40.0))
+    xy = np.stack([objs["x"], objs["y"]], 1)
+    from scipy.spatial import cKDTree
+    d, _ = cKDTree(xy).query(xy, k=2)
+    iso = d[:, 1] > r + 12
+    if iso.sum() >= 10:
+        objs = objs[iso]
+    fl = []
+    for sub in subs:
+        f, _, _ = sep.sum_circle(sub, objs["x"], objs["y"], r, bkgann=(r + 4, r + 10))
         fl.append(f)
     fl = np.stack(fl, 1)
     return fl[(fl > 0).all(1)]
@@ -419,7 +434,9 @@ def deconvolve(img: np.ndarray, strength: float, sat: float, noise_ref: float | 
 
 
 def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.ndarray | None,
-                 params: dict, sat: float, progress=None) -> tuple[np.ndarray, dict]:
+                 params: dict, sat: float, progress=None, sharp: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
+    """``sharp``: output of the self-supervised deconvolution network (denoise.n2n_restore).
+    When present, "deconvolution" blends towards it; otherwise Richardson-Lucy is used."""
     p = {**DEFAULTS, **(params or {})}
     info = {}
     img = stack
@@ -427,6 +444,9 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
     noise_ref = mad_sigma(Ls - cv2.GaussianBlur(Ls, (0, 0), 1.5)) * 1.6  # per-pixel noise of raw stack
     if denoised is not None and p["denoise"] > 0:
         img = stack + float(p["denoise"]) * (denoised - stack)
+    ai_deconv = sharp is not None and denoised is not None and p["deconvolution"] > 0
+    if ai_deconv:
+        img = img + float(p["deconvolution"]) * (sharp - denoised)
     if p["crop"] and coverage is not None:
         y0, y1, x0, x1 = auto_crop_box(coverage, p["crop_threshold"])
         img = img[y0:y1, x0:x1]
@@ -450,7 +470,18 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
         progress(2, 4, "Colour calibration")
     gains = np.ones(3, np.float32)
     if p["white_balance"] == "stars":
-        fl = measure_star_colors(img, sat)
+        wb_src = img
+        if sharp is not None and denoised is not None:
+            # measure star colours on the fully deconvolved image: each channel's halo
+            # light is back in the star core, so the photometry is complete in every
+            # colour and the white balance does not depend on the deconvolution slider
+            extra = (1.0 - (float(p["deconvolution"]) if ai_deconv else 0.0)) * (sharp - denoised)
+            if info.get("crop"):
+                y0, y1, x0, x1 = info["crop"]
+                extra = extra[y0:y1, x0:x1]
+            wb_src = img + extra
+        fl = measure_star_colors(wb_src, sat)
+        del wb_src
         if fl is not None and len(fl) >= 10:
             rg = np.median(fl[:, 0] / fl[:, 1])
             bg_ = np.median(fl[:, 2] / fl[:, 1])
@@ -476,7 +507,10 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
         img = img * (1 - soft) + img.max(-1, keepdims=True) * soft
     if progress:
         progress(3, 4, "Deconvolution")
-    img, dinfo = deconvolve(img, float(p["deconvolution"]), sat, noise_ref=noise_ref)
+    if ai_deconv:
+        dinfo = {"method": "Noise2Noise deconvolution network", "strength": float(p["deconvolution"])}
+    else:
+        img, dinfo = deconvolve(img, float(p["deconvolution"]), sat, noise_ref=noise_ref)
     info["deconvolution"] = dinfo
     # normalise to [0, 1] against the sensor's white level
     img = img / sat

@@ -34,6 +34,7 @@ STACK_DEFAULTS = {
     "local_norm": True,
     "sensitivity": 1.0,      # frame-rejection aggressiveness
     "denoise_iters": 2000,
+    "ai_deconvolution": True,  # train the self-supervised deconvolution network after the denoiser
     "device": "auto",        # auto | cuda | cuda:N | mps | cpu
 }
 
@@ -109,6 +110,7 @@ class Session:
         self.overrides: dict[str, bool] = {}
         self._stack_cache: dict | None = None
         self._den_cache: np.ndarray | None = None
+        self._sharp_cache: np.ndarray | None = None
         self._lin_cache: tuple[str, np.ndarray, dict] | None = None
         self.lock = threading.RLock()
         self.cancel_flag = threading.Event()
@@ -148,6 +150,7 @@ class Session:
             "analysed": self.analysis is not None,
             "stacked": os.path.exists(self._p("stack.fits")),
             "denoised": os.path.exists(self._p("denoised.fits")),
+            "deconvolved": os.path.exists(self._p("sharp.fits")),
             "stack_meta": clean_json(self.meta),
             "filter": self.infos[0].filter if self.infos else None,
             "object": self.infos[0].object if self.infos else None,
@@ -282,24 +285,37 @@ class Session:
                     "created": datetime.now().isoformat(timespec="seconds"),
                     "shape": list(out["stack"].shape)}
             json.dump(meta, open(self._p("stack_meta.json"), "w"), indent=1, default=_json_default)
-            for f in ("denoised.fits",):
+            for f in ("denoised.fits", "sharp.fits", "restore_meta.json", "restore_nets.pt"):
                 if os.path.exists(self._p(f)):
                     os.remove(self._p(f))
             self._stack_cache = {"stack": out["stack"], "coverage": out["coverage"]}
             self._den_cache = None
+            self._sharp_cache = None
             self._lin_cache = None
             return meta
 
     def run_denoise(self, params: dict | None = None, progress=None):
-        from .denoise import n2n_denoise
+        """AI restoration: Noise2Noise denoiser, then (optionally) the N2N deconvolution network."""
+        from .denoise import n2n_restore
         p = {**STACK_DEFAULTS, **(params or {})}
         with self.lock:
             st = self._load_stack()
             a, b = _load_fits(self._p("half_a.fits")), _load_fits(self._p("half_b.fits"))
-            den = n2n_denoise(a, b, st["stack"], iters=int(p["denoise_iters"]), device=p["device"], coverage=st["coverage"],
-                              progress=progress, cancel=self.cancel_flag.is_set)
+            den, sharp, info = n2n_restore(
+                a, b, st["stack"], iters=int(p["denoise_iters"]), device=p["device"], coverage=st["coverage"],
+                progress=progress, cancel=self.cancel_flag.is_set, deconvolve=bool(p["ai_deconvolution"]),
+                sat=self.meta.get("saturation", 63471.0), px_scale=float(self.meta.get("scale", 1.0)),
+                save_path=self._p("restore_nets.pt"))
+            del a, b
             _save_fits(self._p("denoised.fits"), den)
+            if sharp is not None:
+                _save_fits(self._p("sharp.fits"), sharp)
+            elif os.path.exists(self._p("sharp.fits")):
+                os.remove(self._p("sharp.fits"))
+            info["created"] = datetime.now().isoformat(timespec="seconds")
+            json.dump(info, open(self._p("restore_meta.json"), "w"), indent=1, default=_json_default)
             self._den_cache = den
+            self._sharp_cache = sharp
             self._lin_cache = None
             return True
 
@@ -316,6 +332,11 @@ class Session:
             self._den_cache = _load_fits(self._p("denoised.fits"))
         return self._den_cache
 
+    def _load_sharp(self):
+        if self._sharp_cache is None and os.path.exists(self._p("sharp.fits")):
+            self._sharp_cache = _load_fits(self._p("sharp.fits"))
+        return self._sharp_cache
+
     # ------------------------------------------------------------- stage 3
     def linear(self, params: dict, progress=None):
         p = {**DEFAULTS, **(params or {})}
@@ -326,7 +347,7 @@ class Session:
             st = self._load_stack()
             den = self._load_denoised()
             lin, info = linear_stage(st["stack"], st["coverage"], den, p, self.meta.get("saturation", 63471.0),
-                                     progress=progress)
+                                     progress=progress, sharp=self._load_sharp() if den is not None else None)
             self._lin_cache = (key, lin, info)
             return lin, info
 

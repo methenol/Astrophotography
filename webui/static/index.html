@@ -31,7 +31,7 @@
       <ol class="steps">
         <li id="step-analyse"><span class="dot"></span><div><b>Analyse frames</b><small>stars, FWHM, clouds, obstructions, ML anomalies</small></div><button class="btn small" data-job="analyse">Run</button></li>
         <li id="step-stack"><span class="dot"></span><div><b>Register &amp; integrate</b><small>local normalisation, sigma-clip, drizzle</small></div><button class="btn small" data-job="stack">Run</button></li>
-        <li id="step-denoise"><span class="dot"></span><div><b>AI denoise</b><small>self-supervised Noise2Noise on GPU</small></div><button class="btn small" data-job="denoise">Run</button></li>
+        <li id="step-denoise"><span class="dot"></span><div><b>AI denoise &amp; deconvolve</b><small>self-supervised Noise2Noise networks on GPU</small></div><button class="btn small" data-job="denoise">Run</button></li>
       </ol>
       <button class="btn primary wide" data-job="all">▶ Run everything &amp; export</button>
 
@@ -44,6 +44,7 @@
         <label>Sigma high <input id="sp-sigma_high" type="number" step="0.5" value="3"></label>
         <label class="check"><input id="sp-local_norm" type="checkbox" checked> Local normalisation</label>
         <label>Denoise training steps <input id="sp-denoise_iters" type="number" step="250" value="2000"></label>
+        <label class="check" title="After the denoiser, train a second network that learns to undo the star blur (PSF measured from your stars), checked against the independent half-stack. Roughly doubles the AI step's time."><input id="sp-ai_deconvolution" type="checkbox" checked> AI deconvolution network</label>
         <label>Compute device <select id="sp-device"></select></label>
       </details>
     </section>
