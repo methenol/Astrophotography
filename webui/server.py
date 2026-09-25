@@ -48,7 +48,7 @@ PARAM_SPEC = [
     {"group": "Linear", "key": "bg_degree", "label": "Polynomial degree", "type": "range", "min": 1, "max": 4, "step": 1},
     {"group": "Linear", "key": "white_balance", "label": "White balance", "type": "select", "options": ["stars", "background", "none"]},
     {"group": "Linear", "key": "denoise", "label": "AI denoise (Noise2Noise)", "type": "range", "min": 0, "max": 1, "step": 0.05},
-    {"group": "Linear", "key": "deconvolution", "label": "Deconvolution (AI network, or Richardson-Lucy)", "type": "range", "min": 0, "max": 1, "step": 0.05},
+    {"group": "Linear", "key": "deconvolution", "label": "Deconvolution (AI network / ImageMM, or Richardson-Lucy)", "type": "range", "min": 0, "max": 1, "step": 0.05},
     {"group": "Stretch", "key": "stretch", "label": "Stretch (background level)", "type": "range", "min": 0.04, "max": 0.35, "step": 0.01},
     {"group": "Stretch", "key": "auto_stretch", "label": "Adapt stretch to target size", "type": "bool"},
     {"group": "Stretch", "key": "hdr", "label": "HDR (protect bright cores)", "type": "range", "min": 0, "max": 1.5, "step": 0.05},

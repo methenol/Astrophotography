@@ -332,17 +332,21 @@ def measure_star_colors(img: np.ndarray, sat: float) -> np.ndarray | None:
     return fl[(fl > 0).all(1)]
 
 
-def estimate_psf(L: np.ndarray, sat: float, max_stars: int = 150) -> tuple[np.ndarray, float]:
-    """Empirical PSF from isolated, unsaturated stars (sub-pixel re-centred median)."""
+def estimate_psf(L: np.ndarray, sat: float, max_stars: int = 150, max_half: int = 20,
+                 edge_sub: bool = True, bkg_box: int = 64, clip: bool = True) -> tuple[np.ndarray, float]:
+    """Empirical PSF from isolated, unsaturated stars (sub-pixel re-centred median),
+    out to 3 FWHM or ``max_half`` pixels.  ``edge_sub`` removes each cutout's border
+    median (robust, but it also removes the PSF's faint wings); ``clip=False`` keeps
+    the (noisy, slightly negative) far wings for model fitting."""
     Lc = np.ascontiguousarray(L, np.float32)
-    bkg = sep.Background(Lc, bw=64, bh=64)
+    bkg = sep.Background(Lc, bw=bkg_box, bh=bkg_box)
     sub = Lc - bkg.back()
     objs = sep.extract(sub, 10.0, err=bkg.globalrms, minarea=5)
     if len(objs) < 5:
         return None, float("nan")
     fwhm = 2 * sep.flux_radius(sub, objs["x"], objs["y"], 6 * objs["a"], 0.5, subpix=5)[0]
     fw = float(np.median(fwhm[np.isfinite(fwhm)]))
-    half = int(np.clip(np.ceil(3.0 * fw), 5, 20))
+    half = int(np.clip(np.ceil(3.0 * fw), 5, max_half))
     good = ((objs["peak"] < 0.5 * sat) & (objs["flag"] == 0) &
             (objs["peak"] > 30 * bkg.globalrms) & (objs["a"] / np.maximum(objs["b"], 1e-3) < 1.4))
     xy = np.stack([objs["x"], objs["y"]], 1)
@@ -361,8 +365,9 @@ def estimate_psf(L: np.ndarray, sat: float, max_stars: int = 150) -> tuple[np.nd
         c = sub[yi - half - 2: yi + half + 3, xi - half - 2: xi + half + 3].astype(np.float32)
         M = np.float32([[1, 0, xi - x], [0, 1, yi - y]])
         c = cv2.warpAffine(c, M, (c.shape[1], c.shape[0]), flags=cv2.INTER_CUBIC)[2:-2, 2:-2]
-        edge = np.concatenate([c[0], c[-1], c[:, 0], c[:, -1]])
-        c = c - np.median(edge)
+        if edge_sub:
+            edge = np.concatenate([c[0], c[-1], c[:, 0], c[:, -1]])
+            c = c - np.median(edge)
         s = c.sum()
         if s > 0:
             cuts.append(c / s)
@@ -373,7 +378,8 @@ def estimate_psf(L: np.ndarray, sat: float, max_stars: int = 150) -> tuple[np.nd
     psf = (psf + psf[::-1]) / 2
     yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
     psf *= (xx ** 2 + yy ** 2) <= half ** 2
-    psf = np.clip(psf, 0, None)
+    if clip:
+        psf = np.clip(psf, 0, None)
     return (psf / psf.sum()).astype(np.float32), fw
 
 
@@ -434,9 +440,16 @@ def deconvolve(img: np.ndarray, strength: float, sat: float, noise_ref: float | 
 
 
 def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.ndarray | None,
-                 params: dict, sat: float, progress=None, sharp: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
+                 params: dict, sat: float, progress=None, sharp: np.ndarray | None = None,
+                 restored: bool = False, clip_ref: np.ndarray | None = None) -> tuple[np.ndarray, dict]:
     """``sharp``: output of the self-supervised deconvolution network (denoise.n2n_restore).
-    When present, "deconvolution" blends towards it; otherwise Richardson-Lucy is used."""
+    When present, "deconvolution" blends towards it; otherwise Richardson-Lucy is used.
+
+    ``restored``: ``stack`` is already a restoration (ImageMM's latent image): no denoise
+    blend and no further deconvolution; ``clip_ref`` is then the original coadd on the same
+    grid, which tells where the data were saturated (a restored star core may legitimately
+    exceed the sensor's white level), and the output is normalised by the larger of the
+    white level and the image maximum so restored cores are not clipped."""
     p = {**DEFAULTS, **(params or {})}
     info = {}
     img = stack
@@ -495,7 +508,7 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
     # clipped highlights carry no colour information: once white balance scales the
     # channels differently they turn blue/purple/cyan ("coloured blooming").
     # Render every pixel that was clipped in ANY channel neutral (max channel).
-    clip_src = stack
+    clip_src = clip_ref if (restored and clip_ref is not None) else stack
     if info.get("crop"):
         y0, y1, x0, x1 = info["crop"]
         clip_src = clip_src[y0:y1, x0:x1]
@@ -507,12 +520,17 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
         img = img * (1 - soft) + img.max(-1, keepdims=True) * soft
     if progress:
         progress(3, 4, "Deconvolution")
-    if ai_deconv:
+    if restored:
+        dinfo = {"method": "restored (ImageMM)"}
+    elif ai_deconv:
         dinfo = {"method": "Noise2Noise deconvolution network", "strength": float(p["deconvolution"])}
     else:
         img, dinfo = deconvolve(img, float(p["deconvolution"]), sat, noise_ref=noise_ref)
     info["deconvolution"] = dinfo
-    # normalise to [0, 1] against the sensor's white level
+    # normalise to [0, 1] against the sensor's white level (a restoration may exceed it)
+    if restored:
+        sat = max(sat, float(img.max()))
+        info["white_level"] = sat
     img = img / sat
     info["pedestal"] = ped / sat
     info["noise_ref"] = float(noise_ref / sat)  # per-pixel noise of the un-denoised stack

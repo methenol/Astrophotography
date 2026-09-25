@@ -150,13 +150,23 @@ function updateSteps() {
 }
 
 /* ------------------------------------------------------------ jobs */
+// ImageMM options only matter for the ImageMM restoration
+document.addEventListener("change", e => {
+  if (e.target.id === "sp-deconv_method") $("#imagemm-opts").hidden = e.target.value !== "imagemm";
+});
 function stackParams() {
   const g = id => $("#sp-" + id);
   return {
     mode: g("mode").value, scale: parseFloat(g("scale").value), sensitivity: parseFloat(g("sensitivity").value),
     sigma_low: parseFloat(g("sigma_low").value), sigma_high: parseFloat(g("sigma_high").value),
     local_norm: g("local_norm").checked, denoise_iters: parseInt(g("denoise_iters").value), device: g("device").value,
-    ai_deconvolution: g("ai_deconvolution").checked,
+    deconv_method: g("deconv_method").value, ai_deconvolution: g("deconv_method").value !== "none",
+    imagemm_r: parseInt(g("imagemm_r").value), imagemm_sigma: parseFloat(g("imagemm_sigma").value) || 0,
+    imagemm_robust: g("imagemm_robust").checked, imagemm_epsilon: parseFloat(g("imagemm_epsilon").value) || 1e-6,
+    imagemm_stop: g("imagemm_stop").value,
+    imagemm_max_iters: parseInt(g("imagemm_max_iters").value) || 1000, imagemm_psf: g("imagemm_psf").value,
+    imagemm_groups: parseInt(g("imagemm_groups").value) || 0, imagemm_accelerate: g("imagemm_accelerate").checked,
+    imagemm_n2n: g("imagemm_n2n").checked, network_groups: parseInt(g("network_groups").value) || 0,
   };
 }
 function exportOpts() {

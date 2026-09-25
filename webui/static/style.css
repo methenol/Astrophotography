@@ -169,3 +169,7 @@ pre { white-space: pre-wrap; word-break: break-word; margin: 0; }
   .charts { grid-template-columns: repeat(2, 1fr); }
   .frames-body { grid-template-columns: 1fr; }
 }
+details.adv fieldset { border: 1px solid var(--line, rgba(127,127,127,.3)); border-radius: 8px; padding: 2px 10px 4px; margin: 10px 0; }
+details.adv fieldset[hidden] { display: none; }
+details.adv legend { color: var(--muted); font-size: 12px; padding: 0 4px; }
+details.adv label input[type=number] { width: 90px; }

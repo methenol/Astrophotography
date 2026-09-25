@@ -277,12 +277,12 @@ def infer(net: nn.Module, g: np.ndarray, tile: int = 512, overlap: int = 96, dev
     return out / np.maximum(acc, 1e-6)
 
 
-def channel_psfs(img: np.ndarray, sat: float) -> np.ndarray | None:
+def channel_psfs(img: np.ndarray, sat: float, max_half: int = 20) -> np.ndarray | None:
     """Per-channel empirical PSFs (refractors focus colours differently), padded to one size."""
     from .postprocess import estimate_psf
     psfs = []
     for c in range(img.shape[2]):
-        p, _ = estimate_psf(img[..., c], sat)
+        p, _ = estimate_psf(img[..., c], sat, max_half=max_half)
         if p is None:
             return None
         psfs.append(p)
@@ -312,17 +312,69 @@ def deconv_floor(sharp: np.ndarray, den: np.ndarray, size: int) -> np.ndarray:
     return np.maximum(sharp, np.minimum(den, sky)).astype(np.float32)
 
 
+def finish_sharp(sharp: np.ndarray, den: np.ndarray, full: np.ndarray, sat: float, psf_size: int) -> np.ndarray:
+    """Common last step of every deconvolution: the local-sky floor (``deconv_floor``),
+    then saturated stars, which carry no shape information, get the denoised profile back."""
+    sharp = deconv_floor(sharp, den, psf_size)
+    unsat = (full.max(-1) < 0.5 * sat).astype(np.uint8)
+    satm = cv2.dilate(1 - unsat, np.ones((2 * psf_size + 1,) * 2, np.uint8)).astype(np.float32)
+    satm = cv2.GaussianBlur(satm, (0, 0), psf_size / 3)[..., None]
+    return (sharp * (1 - satm) + den * satm).astype(np.float32)
+
+
+def mf_data_term(x: torch.Tensor, tgts: list, mf: dict, tw: torch.Tensor, patch: int, device):
+    """Multi-frame data term of ``train_n2n_deconv`` for a batch of linear stack-grid patches x
+    (B, C, P, P): tgts[q] = (target set index, patch origin y, x) on the stack grid (multiples
+    of s); tw (C, H, W): > 0 where the stack is not saturated.  Returns (sum of 2 rho_Huber
+    over valid exposure pixels of all groups, number of those pixels)."""
+    from .imagemm import stack_forward
+    s_ = int(mf["s"])
+    delta = float(mf.get("delta", 2.0))
+    data = torch.zeros((), device=device)
+    count = torch.zeros((), device=device)
+    for q, (which, y, xo) in enumerate(tgts):
+        T_ = mf["sets"][which]
+        pred, e0 = stack_forward(x[q:q + 1], T_["kernels"], s_)                # (1, G, C, n, n)
+        n = pred.shape[-1]
+        lo = int(round(e0))
+        ey, ex = y // s_ + lo, xo // s_ + lo
+        sly = (slice(None), slice(ey, ey + n), slice(ex, ex + n))
+        yt, vt, mt = (torch.from_numpy(np.ascontiguousarray(np.moveaxis(T_[k][sly], -1, 1))).to(device)
+                      for k in ("y", "v", "m"))
+        # an exposure pixel counts only if every stack pixel of its s x s block is unsaturated
+        ok = tw[:, y:y + patch, xo:xo + patch][None].to(device).gt(0).float()
+        ok = (F.avg_pool2d(ok, s_) > 0.999).float() if s_ > 1 else ok
+        mt = mt * ok[0, :, lo:lo + n, lo:lo + n]
+        zres = (yt - pred[0]) / vt.clamp_min(1e-30).sqrt()
+        a = zres.abs()
+        rho = torch.where(a <= delta, 0.5 * zres ** 2, delta * (a - 0.5 * delta))       # Huber, Eq. 15
+        data = data + (2 * rho * mt).sum()
+        count = count + mt.sum()
+    return data, count
+
+
 def train_n2n_deconv(net: nn.Module, da: np.ndarray, db: np.ndarray, a: np.ndarray, b: np.ndarray,
                      stab: Stabiliser, psfs: np.ndarray, var: np.ndarray, weight: np.ndarray, sky: np.ndarray,
                      iters: int = 2000, patch: int = 128, batch: int = 12, hessian: float = 0.3,
                      floor: float = 3.0, margin: float = 0.5, device=None, progress=None, cancel=None,
-                     sample_mask: np.ndarray | None = None, seed: int = 0) -> nn.Module:
+                     sample_mask: np.ndarray | None = None, seed: int = 0, mf: dict | None = None) -> nn.Module:
     """Self-supervised deconvolution network (see module docstring).
 
     da/db: denoised halves (stabilised domain) = network inputs; a/b: raw linear halves
     = targets; var: per-pixel noise variance of one half; weight: 0 where the data is
     saturated; sky: smooth per-channel sky level (linear).
     loss = chi2(psf * x, other half) + hessian * |Hessian(g(x))|^2 + floor * |undershoot below sky|^2
+
+    ``mf``: ImageMM's multi-frame likelihood (arXiv:2501.03002, Eq. 14 with the Huber loss)
+    as the data term instead of chi2 against the other half-stack.  mf = {"sets": [T_A, T_B],
+    "s": stack scale, "delta": 2.0}: T_A is the target set for the half-A input (built from
+    the odd subs, independent of half A), T_B for the half-B input (even subs); each is
+    {"y", "v", "m": (G, H0, W0, C) seeing-group coadds on the exposure grid (exposures.
+    ExposureSet.group_coadds), "kernels": (G, C, k, k) torch tensor on the stack grid}.
+    The data term is 2 mean(rho_Huber((y_g - D H_g x) / sigma_g)) over valid pixels of all
+    groups (= chi2 for small residuals), with D H_g from imagemm.stack_forward.
+    Augmentation (rotations / flips) is applied to the network input only; its output is
+    turned back before the forward model, so asymmetric PSFs are handled exactly.
     """
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
@@ -334,9 +386,12 @@ def train_n2n_deconv(net: nn.Module, da: np.ndarray, db: np.ndarray, a: np.ndarr
     tda, tdb, ta, tb = T(da), T(db), T(a), T(b)
     tw = T(weight[..., None] / var)
     tsky, tsig = T(sky), T(np.sqrt(var / 2))
+    nc = psfs.shape[0]
     kt = torch.from_numpy(psfs[:, None].copy()).to(device)
     r = psfs.shape[1] // 2
-    nc = psfs.shape[0]
+    if mf is not None:
+        s_ = int(mf["s"])
+        patch -= patch % s_
     opt = torch.optim.Adam(net.parameters(), lr=3e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, iters)
     h, w, _ = da.shape
@@ -355,21 +410,50 @@ def train_n2n_deconv(net: nn.Module, da: np.ndarray, db: np.ndarray, a: np.ndarr
             pick = cand[rng.integers(0, len(cand), batch)]
         else:
             pick = np.stack([rng.integers(0, h - patch, batch), rng.integers(0, w - patch, batch)], 1)
-        parts = [[] for _ in range(5)]
-        for (y, x), s in zip(pick, rng.random(batch) < 0.5):
-            sl = (slice(None), slice(y, y + patch), slice(x, x + patch))
-            src = (tdb, ta) if s else (tda, tb)
-            rot = int(rng.integers(0, 4))            # the PSF is 4-fold symmetrised: rotations are exact
-            for lst, z in zip(parts, (src[0][sl], src[1][sl], tw[sl], tsky[sl], tsig[sl])):
-                lst.append(torch.rot90(z, rot, (1, 2)))
-        inp, tgt, wt, skyp, sigp = (torch.stack(z).to(device) for z in parts)
-        with _autocast(device):
-            g = net(inp)
-        g = g.float()
-        x = inv(g)
-        kx = F.conv2d(F.pad(x, (r, r, r, r), mode="reflect"), kt, groups=nc)
-        sl = (slice(None), slice(None), slice(r, -r), slice(r, -r))
-        chi2 = ((kx - tgt) ** 2 * wt)[sl].mean() / (wt[sl] > 0).float().mean().clamp_min(1e-3)
+        if mf is not None:
+            pick = pick - pick % s_                    # patch origins on the exposure grid's blocks
+            inp, xs_, tgts = [], [], []
+            for (y, x), sw in zip(pick, rng.random(batch) < 0.5):
+                sl = (slice(None), slice(y, y + patch), slice(x, x + patch))
+                src = tdb if sw else tda
+                rot, fl = int(rng.integers(0, 4)), bool(rng.random() < 0.5)
+                z = torch.rot90(src[sl], rot, (1, 2))
+                inp.append(z.flip(2) if fl else z)
+                xs_.append((rot, fl))
+                tgts.append((1 if sw else 0, y, x))
+            inp = torch.stack(inp).to(device)
+            with _autocast(device):
+                g = net(inp)
+            g = g.float()
+            # back to the sky's orientation before the forward model (PSFs are not symmetric)
+            gb = []
+            for q, (rot, fl) in enumerate(xs_):
+                z = g[q]
+                z = z.flip(2) if fl else z
+                gb.append(torch.rot90(z, -rot, (1, 2)))
+            g = torch.stack(gb)
+            x = inv(g)
+            data, count = mf_data_term(x, tgts, mf, tw, patch, device)
+            chi2 = data / count.clamp_min(1.0)
+        else:
+            parts = [[] for _ in range(5)]
+            for (y, x), s in zip(pick, rng.random(batch) < 0.5):
+                sl = (slice(None), slice(y, y + patch), slice(x, x + patch))
+                src = (tdb, ta) if s else (tda, tb)
+                rot = int(rng.integers(0, 4))            # the PSF is 4-fold symmetrised: rotations are exact
+                for lst, z in zip(parts, (src[0][sl], src[1][sl], tw[sl], tsky[sl], tsig[sl])):
+                    lst.append(torch.rot90(z, rot, (1, 2)))
+            inp, tgt, wt, skyp, sigp = (torch.stack(z).to(device) for z in parts)
+            with _autocast(device):
+                g = net(inp)
+            g = g.float()
+            x = inv(g)
+            kx = F.conv2d(F.pad(x, (r, r, r, r), mode="reflect"), kt, groups=nc)
+            sl = (slice(None), slice(None), slice(r, -r), slice(r, -r))
+            chi2 = ((kx - tgt) ** 2 * wt)[sl].mean() / (wt[sl] > 0).float().mean().clamp_min(1e-3)
+        if mf is not None:
+            skyp = torch.stack([tsky[:, y:y + patch, xo:xo + patch] for (_, y, xo) in tgts]).to(device)
+            sigp = torch.stack([tsig[:, y:y + patch, xo:xo + patch] for (_, y, xo) in tgts]).to(device)
         dxx = g[..., :, 2:] - 2 * g[..., :, 1:-1] + g[..., :, :-2]
         dyy = g[..., 2:, :] - 2 * g[..., 1:-1, :] + g[..., :-2, :]
         dxy = g[..., 1:, 1:] - g[..., 1:, :-1] - g[..., :-1, 1:] + g[..., :-1, :-1]
@@ -391,8 +475,12 @@ def n2n_restore(half_a: np.ndarray, half_b: np.ndarray, full: np.ndarray | None 
                 iters: int = 2000, device: str = "auto", progress=None, cancel=None,
                 coverage: np.ndarray | None = None, deconvolve: bool = True,
                 deconv_iters: int | None = None, sat: float = 63471.0,
-                px_scale: float = 1.0, save_path: str | None = None) -> tuple[np.ndarray, np.ndarray | None, dict]:
+                px_scale: float = 1.0, save_path: str | None = None,
+                mf: dict | None = None) -> tuple[np.ndarray, np.ndarray | None, dict]:
     """Train on the half-stacks; return (denoised, deconvolved-or-None, info), all linear.
+
+    ``mf``: the ImageMM multi-frame data term for the deconvolution network (see
+    ``train_n2n_deconv``); its kernels may be numpy arrays (moved to the device here).
 
     High-SNR pixels (bright star cores, > ~80 sigma) are rare in training data
     and noise there is invisible, so the denoiser smoothly hands them back to the
@@ -451,21 +539,21 @@ def n2n_restore(half_a: np.ndarray, half_b: np.ndarray, full: np.ndarray | None 
             unsat = (full.max(-1) < 0.5 * sat).astype(np.uint8)
             weight = cv2.erode(unsat, np.ones((9, 9), np.uint8)).astype(np.float32)
             sky = _sky_map(full, int(64 * px_scale))
+            if mf is not None:
+                for T_ in mf["sets"]:
+                    T_["kernels"] = torch.as_tensor(T_["kernels"], dtype=torch.float32, device=dev)
+                info["multiframe"] = {"groups": len(mf["sets"][0]["kernels"]), "s": mf["s"]}
             dnet = train_n2n_deconv(copy.deepcopy(net), da, db, half_a, half_b, stab, psfs, var, weight, sky,
                                     iters=deconv_iters or (iters if dev.type != "cpu" else min(iters, 400)),
                                     batch=max(4, batch * 3 // 4), device=dev, progress=progress,
-                                    cancel=cancel, sample_mask=mask)
+                                    cancel=cancel, sample_mask=mask, mf=mf)
             del da, db, sky
             if progress:
                 progress(0, 1, "Deconvolving")
             ov = int(min(tile // 3, max(128, 4 * psfs.shape[1])))
             sharp = stab.inv(infer(dnet, g_den, tile=max(tile, 3 * ov), overlap=ov, tta=tta))
-            sharp = deconv_floor(sharp, den, psfs.shape[1])
             del var
-            # saturated stars: no shape information -> keep the denoised profile there
-            satm = cv2.dilate(1 - unsat, np.ones((2 * psfs.shape[1] + 1,) * 2, np.uint8)).astype(np.float32)
-            satm = cv2.GaussianBlur(satm, (0, 0), psfs.shape[1] / 3)[..., None]
-            sharp = (sharp * (1 - satm) + den * satm).astype(np.float32)
+            sharp = finish_sharp(sharp, den, full, sat, psfs.shape[1])
     if save_path:
         torch.save({"denoiser": net.state_dict(), "deconv": dnet.state_dict() if dnet is not None else None,
                     "stab": {"sigma": stab.sigma, "bg": stab.bg, "k": stab.k},

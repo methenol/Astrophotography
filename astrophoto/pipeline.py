@@ -11,6 +11,7 @@ import json
 import os
 import pickle
 import re
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -35,6 +36,20 @@ STACK_DEFAULTS = {
     "sensitivity": 1.0,      # frame-rejection aggressiveness
     "denoise_iters": 2000,
     "ai_deconvolution": True,  # train the self-supervised deconvolution network after the denoiser
+    "deconv_method": "network",  # network | imagemm | none
+    # ImageMM (arXiv:2501.03002) on the individual subs, see astrophoto/imagemm.py
+    "imagemm_r": 1,          # super-resolution factor r (Algorithm 2 for r > 1)
+    "imagemm_sigma": 0.0,    # g_sigma of Eq. 11 in latent pixels; 0 = none for r = 1, 1.1 for r > 1
+    "imagemm_robust": True,  # Algorithm 3 (Huber, delta = 2) instead of the L2 loss
+    "imagemm_epsilon": 1e-6,  # stopping tolerance (the paper uses 1e-4 ... 1e-6)
+    "imagemm_stop": "c15",   # c15 (Eq. C15, the paper) | elementwise (mean |u'_k/u'_k-1 - 1|)
+    "imagemm_max_iters": 1000,
+    "imagemm_psf": "empirical",  # empirical | moffat
+    "imagemm_groups": 0,     # 0 = every exposure (the paper); N = N seeing-group coadds
+    "imagemm_accelerate": False,  # Biggs & Andrews extrapolation (not in the paper)
+    "imagemm_n2n": False,    # ImageMM on even / odd subs + Noise2Noise pass
+    "network_groups": 0,     # > 0: the network's data term is ImageMM's multi-frame likelihood over
+                             # this many seeing-group coadds of the other half's subs
     "device": "auto",        # auto | cuda | cuda:N | mps | cpu
 }
 
@@ -111,6 +126,7 @@ class Session:
         self._stack_cache: dict | None = None
         self._den_cache: np.ndarray | None = None
         self._sharp_cache: np.ndarray | None = None
+        self._restored_cache: dict | None = None
         self._lin_cache: tuple[str, np.ndarray, dict] | None = None
         self.lock = threading.RLock()
         self.cancel_flag = threading.Event()
@@ -150,7 +166,7 @@ class Session:
             "analysed": self.analysis is not None,
             "stacked": os.path.exists(self._p("stack.fits")),
             "denoised": os.path.exists(self._p("denoised.fits")),
-            "deconvolved": os.path.exists(self._p("sharp.fits")),
+            "deconvolved": os.path.exists(self._p("sharp.fits")) or os.path.exists(self._p("imagemm.fits")),
             "stack_meta": clean_json(self.meta),
             "filter": self.infos[0].filter if self.infos else None,
             "object": self.infos[0].object if self.infos else None,
@@ -263,6 +279,10 @@ class Session:
                 self.run_analysis(p["sensitivity"], progress)
             elif abs(self.analysis.get("sensitivity", 1.0) - p["sensitivity"]) > 1e-6:
                 self.reselect(p["sensitivity"])
+            # the prepared ImageMM exposures use this coadd as their reference: stale after a restack
+            for d in ("groups", "imagemm"):
+                if os.path.isdir(self._p(d)):
+                    shutil.rmtree(self._p(d))
             integ = Integrator(self.infos, self.analysis, self.defects, mode=p["mode"], scale=float(p["scale"]),
                                sigma_low=float(p["sigma_low"]), sigma_high=float(p["sigma_high"]),
                                local_norm=bool(p["local_norm"]), progress=progress,
@@ -285,7 +305,8 @@ class Session:
                     "created": datetime.now().isoformat(timespec="seconds"),
                     "shape": list(out["stack"].shape)}
             json.dump(meta, open(self._p("stack_meta.json"), "w"), indent=1, default=_json_default)
-            for f in ("denoised.fits", "sharp.fits", "restore_meta.json", "restore_nets.pt"):
+            for f in ("denoised.fits", "sharp.fits", "restore_meta.json", "restore_nets.pt", "imagemm.fits",
+                      "imagemm_coverage.fits"):
                 if os.path.exists(self._p(f)):
                     os.remove(self._p(f))
             self._stack_cache = {"stack": out["stack"], "coverage": out["coverage"]}
@@ -294,30 +315,113 @@ class Session:
             self._lin_cache = None
             return meta
 
+    def exposure_set(self, progress=None):
+        """The prepared ImageMM exposures (exposures.ExposureSet), cached in imagemm/."""
+        from .exposures import ExposureSet
+        ref = _load_fits(self._p("stack.fits"))
+        s = float(self.meta.get("scale", 1.0))
+        W0, H0 = self.infos[0].width, self.infos[0].height
+        if abs(s - 1) > 1e-6:
+            # a drizzled stack at integer scale s: output pixel u is centred on reference
+            # (u + 0.5)/s - 0.5, so s x s area averaging is exactly the reference grid
+            ref = cv2.resize(ref, (W0, H0), interpolation=cv2.INTER_AREA)
+        es = ExposureSet(self.infos, self.analysis, self.defects, ref, self.meta.get("saturation", 63471.0))
+        path = self._p("imagemm/exposures.pkl")
+        if os.path.exists(path):
+            try:
+                return es.load(path)
+            except Exception:
+                pass
+        es.prepare(progress=progress, cancel=self.cancel_flag.is_set)
+        os.makedirs(self._p("imagemm"), exist_ok=True)
+        es.save(path)
+        return es
+
+    def multiframe_targets(self, n_groups: int, sigma: float, psf_model: str, progress=None) -> dict:
+        """Targets of the deconvolution network's multi-frame data term: seeing-group coadds of
+        the odd subs (for the half-A input, which holds the even subs) and of the even subs
+        (for half B), with their PSFs on the stack grid - the group PSF for a 1x stack, the
+        Eq. 11 kernels (r = scale, g_sigma) for an integer drizzle scale."""
+        from .imagemm import superresolved_kernels
+        s = float(self.meta.get("scale", 1.0))
+        if abs(s - round(s)) > 1e-6:
+            raise RuntimeError("the multi-frame loss needs an integer stack scale (1x or 2x)")
+        s = int(round(s))
+        es = self.exposure_set(progress)
+        use = es.usable()
+        sets = []
+        for parity in (1, 0):                       # half A = even stacker frames -> odd-sub targets
+            idx = [k for k in use if k % 2 == parity]
+            T_ = es.group_coadds(idx, n_groups, psf_model, progress=progress, cancel=self.cancel_flag.is_set)
+            if s > 1:
+                T_["kernels"], _ = superresolved_kernels(T_["kernels"], s, sigma)
+            sets.append(T_)
+        return {"sets": sets, "s": s, "delta": 2.0}
+
     def run_denoise(self, params: dict | None = None, progress=None):
-        """AI restoration: Noise2Noise denoiser, then (optionally) the N2N deconvolution network."""
+        """Restoration: Noise2Noise denoiser and (optionally) the N2N deconvolution network,
+        or ImageMM on the individual subs."""
         from .denoise import n2n_restore
         p = {**STACK_DEFAULTS, **(params or {})}
+        method = p.get("deconv_method") or "network"
+        if method == "network" and not p.get("ai_deconvolution", True):
+            method = "none"
         with self.lock:
-            st = self._load_stack()
-            a, b = _load_fits(self._p("half_a.fits")), _load_fits(self._p("half_b.fits"))
-            den, sharp, info = n2n_restore(
-                a, b, st["stack"], iters=int(p["denoise_iters"]), device=p["device"], coverage=st["coverage"],
-                progress=progress, cancel=self.cancel_flag.is_set, deconvolve=bool(p["ai_deconvolution"]),
-                sat=self.meta.get("saturation", 63471.0), px_scale=float(self.meta.get("scale", 1.0)),
-                save_path=self._p("restore_nets.pt"))
-            del a, b
-            _save_fits(self._p("denoised.fits"), den)
-            if sharp is not None:
-                _save_fits(self._p("sharp.fits"), sharp)
-            elif os.path.exists(self._p("sharp.fits")):
-                os.remove(self._p("sharp.fits"))
+            if method == "imagemm":
+                from . import imagemm
+                es = self.exposure_set(progress)
+                sigma = float(p.get("imagemm_sigma") or 0) or None
+                lat, info = imagemm.restore(
+                    es, r=int(p["imagemm_r"]), sigma=sigma, psf_model=p["imagemm_psf"],
+                    n_groups=int(p["imagemm_groups"]), robust=bool(p["imagemm_robust"]),
+                    epsilon=float(p["imagemm_epsilon"]), stop=p.get("imagemm_stop", "c15"),
+                    max_iters=int(p["imagemm_max_iters"]),
+                    accelerate=bool(p["imagemm_accelerate"]), n2n=bool(p.get("imagemm_n2n")),
+                    n2n_iters=int(p["denoise_iters"]), device=p["device"], progress=progress,
+                    cancel=self.cancel_flag.is_set)
+                cov = info.pop("coverage").mean(-1)
+                _save_fits(self._p("imagemm.fits"), lat)
+                _save_fits(self._p("imagemm_coverage.fits"), (cov / max(float(cov.max()), 1e-12)).astype(np.float32))
+                info["ptc"] = {k: np.asarray(v).tolist() for k, v in es.ptc.items()}
+                self._restored_cache = None
+            else:
+                st = self._load_stack()
+                mf = None
+                if method == "network" and int(p.get("network_groups") or 0) > 0:
+                    mf = self.multiframe_targets(int(p["network_groups"]), float(p.get("imagemm_sigma") or 0) or 1.1,
+                                                 p["imagemm_psf"], progress)
+                a, b = _load_fits(self._p("half_a.fits")), _load_fits(self._p("half_b.fits"))
+                den, sharp, info = n2n_restore(
+                    a, b, st["stack"], iters=int(p["denoise_iters"]), device=p["device"], coverage=st["coverage"],
+                    progress=progress, cancel=self.cancel_flag.is_set, deconvolve=method == "network",
+                    sat=self.meta.get("saturation", 63471.0), px_scale=float(self.meta.get("scale", 1.0)),
+                    save_path=self._p("restore_nets.pt"), mf=mf)
+                del a, b
+                _save_fits(self._p("denoised.fits"), den)
+                if sharp is not None:
+                    _save_fits(self._p("sharp.fits"), sharp)
+                elif os.path.exists(self._p("sharp.fits")):
+                    os.remove(self._p("sharp.fits"))
+                self._den_cache = den
+                self._sharp_cache = sharp
+            info["deconv_method"] = method
             info["created"] = datetime.now().isoformat(timespec="seconds")
             json.dump(info, open(self._p("restore_meta.json"), "w"), indent=1, default=_json_default)
-            self._den_cache = den
-            self._sharp_cache = sharp
             self._lin_cache = None
             return True
+
+    def _restoration_method(self) -> str | None:
+        p = self._p("restore_meta.json")
+        return json.load(open(p)).get("deconv_method") if os.path.exists(p) else None
+
+    def _load_restored(self):
+        """The ImageMM latent image and its coverage, if that was the last restoration."""
+        if self._restoration_method() != "imagemm" or not os.path.exists(self._p("imagemm.fits")):
+            return None
+        if self._restored_cache is None:
+            self._restored_cache = {"image": _load_fits(self._p("imagemm.fits")),
+                                    "coverage": _load_fits(self._p("imagemm_coverage.fits"))}
+        return self._restored_cache
 
     def _load_stack(self):
         if self._stack_cache is None:
@@ -345,9 +449,23 @@ class Session:
             if self._lin_cache and self._lin_cache[0] == key:
                 return self._lin_cache[1], self._lin_cache[2]
             st = self._load_stack()
-            den = self._load_denoised()
-            lin, info = linear_stage(st["stack"], st["coverage"], den, p, self.meta.get("saturation", 63471.0),
-                                     progress=progress, sharp=self._load_sharp() if den is not None else None)
+            rest = self._load_restored()
+            if rest is not None:
+                # ImageMM's latent image is already restored (deconvolved, sky noise suppressed):
+                # no denoise blend and no second deconvolution
+                img, cov = rest["image"], rest["coverage"]
+                ref = st["stack"]
+                clip_ref = cv2.resize(ref, (img.shape[1], img.shape[0]),
+                                      interpolation=cv2.INTER_AREA if ref.shape[1] > img.shape[1] else cv2.INTER_LINEAR)
+                lin, info = linear_stage(img, cov, None, p, self.meta.get("saturation", 63471.0),
+                                         progress=progress, restored=True, clip_ref=clip_ref)
+                info["restoration"] = "ImageMM"
+                info["upscaled"] = img.shape[1] / st["stack"].shape[1]
+            else:
+                den = self._load_denoised()
+                sharp = self._load_sharp() if den is not None else None
+                lin, info = linear_stage(st["stack"], st["coverage"], den, p, self.meta.get("saturation", 63471.0),
+                                         progress=progress, sharp=sharp)
             self._lin_cache = (key, lin, info)
             return lin, info
 
@@ -367,7 +485,7 @@ class Session:
         _, info = self.linear(params)
         img = st["stack"]
         if "crop" in info:
-            y0, y1, x0, x1 = info["crop"]
+            y0, y1, x0, x1 = (int(round(v / info.get("upscaled", 1.0))) for v in info["crop"])
             img = img[y0:y1, x0:x1]
         f = min(1.0, max_size / max(img.shape[:2]))
         img = cv2.resize(img, (int(img.shape[1] * f), int(img.shape[0] * f)), interpolation=cv2.INTER_AREA)
@@ -420,6 +538,13 @@ class Session:
         files = self.export(proc_params or {}, progress=progress, **export_kw)
         files["seconds"] = round(time.time() - t0, 1)
         return files
+
+
+def _resize_to(img: np.ndarray, shape) -> np.ndarray:
+    """Resample an image (or a coverage map) onto another grid of the same field."""
+    interp = cv2.INTER_LANCZOS4 if img.ndim == 3 else cv2.INTER_LINEAR
+    out = cv2.resize(img, (shape[1], shape[0]), interpolation=interp)
+    return np.maximum(out, 0) if img.ndim == 2 else out
 
 
 def autostretch(img: np.ndarray, target: float = 0.2) -> np.ndarray:

@@ -31,7 +31,7 @@
       <ol class="steps">
         <li id="step-analyse"><span class="dot"></span><div><b>Analyse frames</b><small>stars, FWHM, clouds, obstructions, ML anomalies</small></div><button class="btn small" data-job="analyse">Run</button></li>
         <li id="step-stack"><span class="dot"></span><div><b>Register &amp; integrate</b><small>local normalisation, sigma-clip, drizzle</small></div><button class="btn small" data-job="stack">Run</button></li>
-        <li id="step-denoise"><span class="dot"></span><div><b>AI denoise &amp; deconvolve</b><small>self-supervised Noise2Noise networks on GPU</small></div><button class="btn small" data-job="denoise">Run</button></li>
+        <li id="step-denoise"><span class="dot"></span><div><b>AI denoise &amp; deconvolve</b><small>self-supervised Noise2Noise networks, ImageMM multi-frame restoration</small></div><button class="btn small" data-job="denoise">Run</button></li>
       </ol>
       <button class="btn primary wide" data-job="all">▶ Run everything &amp; export</button>
 
@@ -44,7 +44,23 @@
         <label>Sigma high <input id="sp-sigma_high" type="number" step="0.5" value="3"></label>
         <label class="check"><input id="sp-local_norm" type="checkbox" checked> Local normalisation</label>
         <label>Denoise training steps <input id="sp-denoise_iters" type="number" step="250" value="2000"></label>
-        <label class="check" title="After the denoiser, train a second network that learns to undo the star blur (PSF measured from your stars), checked against the independent half-stack. Roughly doubles the AI step's time."><input id="sp-ai_deconvolution" type="checkbox" checked> AI deconvolution network</label>
+        <label title="AI network: a second Noise2Noise network learns to undo the star blur of the stack, checked against the independent half-stack. ImageMM (arXiv:2501.03002): one latent image fitted to every sub at once, each with its own measured PSF, variances and masks (majorization-minimization); the sky background is driven to zero. None: Richardson-Lucy in processing.">Restoration <select id="sp-deconv_method"><option value="network">AI network (Noise2Noise)</option><option value="imagemm">ImageMM (all subs)</option><option value="none">None (Richardson-Lucy later)</option></select></label>
+        <fieldset id="imagemm-opts" hidden><legend>ImageMM</legend>
+        <label title="Super-resolution factor r: the latent image has r× the resolution of the subs (Algorithm 2 with the PSFs of Eq. 11). Best on a 1× stack reference; each sub is used at its native resolution.">Super-resolution <select id="sp-imagemm_r"><option value="1">1× (Algorithm 1/3)</option><option value="2">2× (Algorithm 2)</option></select></label>
+        <label title="Standard deviation (latent pixels) of the Gaussian g_sigma in Eq. 11: the latent image is the sky seen through g_sigma. 0 = none at 1×; the paper uses 1.1 at 2× and 1 at 1×.">g<sub>σ</sub> (px) <input id="sp-imagemm_sigma" type="number" step="0.1" min="0" value="0"></label>
+        <label class="check" title="Algorithm 3: Huber M-estimator (delta = 2), robust to satellite trails and other outliers. Off: the plain L2 likelihood (Algorithm 1/2).">
+          <input id="sp-imagemm_robust" type="checkbox" checked> Robust (Huber)</label>
+        <label title="When to stop. Eq. C15 (the paper): the mean of u′k/u′k−1 over the effective mask is within ε of 1 — a necessary condition; ratios above and below 1 can cancel. Elementwise: the mean of |u′k/u′k−1 − 1| is below ε. Measured on M 27 at ε = 1e-6: 185 vs 784 iterations; distance from a 1500-iteration solution max 11 % vs 3.5 % of the peak (at the brightest star cores), rms 0.5 % vs 0.2 %.">Stopping rule <select id="sp-imagemm_stop"><option value="c15">Eq. C15 (paper)</option><option value="elementwise">Elementwise</option></select></label>
+        <label title="Stopping tolerance ε (the paper uses 1e-4 … 1e-6).">Tolerance ε <input id="sp-imagemm_epsilon" type="number" step="any" min="0" value="0.000001"></label>
+        <label title="Maximum number of iterations K.">Max iterations <input id="sp-imagemm_max_iters" type="number" step="100" min="10" value="1000"></label>
+        <label title="PSF of each sub: empirical (measured from its stars, as in the paper) or an elliptical Moffat model fitted to it.">PSF model <select id="sp-imagemm_psf"><option value="empirical">Empirical</option><option value="moffat">Moffat fit</option></select></label>
+        <label title="0 = every sub is its own exposure (the paper). N = subs sorted by PSF width into N groups, each replaced by its inverse-variance coadd with the weight-averaged PSF: faster, exact when a group shares one PSF.">Seeing groups <input id="sp-imagemm_groups" type="number" step="1" min="0" value="0"></label>
+        <label class="check" title="Biggs &amp; Andrews (1997) vector extrapolation of the multiplicative update: fewer iterations to the same fixed point. Not part of ImageMM.">
+          <input id="sp-imagemm_accelerate" type="checkbox"> Biggs–Andrews acceleration</label>
+        <label class="check" title="Restore the even and the odd subs separately (disjoint data, independent noise) and combine them with a Noise2Noise network trained on that pair (unbiased linear-domain loss). Twice the ImageMM time plus training.">
+          <input id="sp-imagemm_n2n" type="checkbox"> Noise2Noise pass</label>
+        </fieldset>
+        <label title="AI network only: replace its data term by ImageMM's multi-frame likelihood (Huber) over this many seeing-group coadds of the other half's subs, each with its own PSF and exact variances. 0 = the single-PSF half-stack loss.">Multi-frame loss groups <input id="sp-network_groups" type="number" step="1" min="0" value="0"></label>
         <label>Compute device <select id="sp-device"></select></label>
       </details>
     </section>

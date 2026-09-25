@@ -128,6 +128,111 @@ isolated stars), but a hard stretch shows it as a dark disk. Production now clam
 the output at min(denoised, local median sky over 3 PSF widths) (`deconv_floor`),
 which removes it and leaves dark lanes alone.
 
+## ImageMM (arXiv:2501.03002) on the individual subs
+
+`astrophoto/imagemm.py` implements ImageMM (Sukurdeep, Budavári, Connolly & Navarro 2025)
+as published. `astrophoto/exposures.py` produces the data products the paper assumes
+(Sec. 2) from the raw subs.
+
+**The paper, equation by equation.**
+* **Latent image:** background-subtracted (sky = 0), non-negative, padded by d′ − 1 so every
+  exposure pixel is fully modelled.
+* **Operators:** H(t) is the valid convolution with each sub's PSF; D is average pooling and
+  Dᵀ subdivides into replicas.
+* **Updates:** the multiplicative MM updates of Algorithms 1 and 2, with W = m/v and κ = 2
+  clipping.
+* **Robust variant:** Algorithm 3, with Huber weights ψ recomputed every iteration (δ = 2).
+* **Initial guess:** the median of the exposures.
+* **Stopping:** Eq. C15, with μ = 0.1 and ε in the paper's range.
+* **Super-resolution:** the Eq. 11 kernels are solved by Adam against a Monte-Carlo g_σ.
+* **Convolution:** computed directly (im2col × kernel matrix, bit-identical to `conv2d`).
+
+**Exposures (Sec. 2 inputs).**
+* **Demosaic:** linear (bilinear), because the model is a linear convolution.
+* **Registration:** the analysis transform plus a WINPOS-based residual refinement. Its RMS
+  equals the centroid noise (0.08–0.10 px on M 27).
+* **Photometric scale:** per channel, from aperture photometry against the coadd.
+* **Background:** each sub's smooth deviation from the coadd, plus the coadd's sky model.
+* **Variances:** a photon-transfer fit over all consecutive pairs (M 27: c₁ ≈ 21–29 ADU per
+  electron, read noise ≈ 1.2–1.4 e⁻). Normalised pair differences have σ = 0.97–0.99 at every level.
+* **Masks:** saturation and footprint, and repaired hot pixels only where they dominate
+  the interpolation.
+* **PSFs:** each sub's own empirical PSF per channel, from 70–85 stars, measured at the
+  reference positions.
+
+**Verified against the paper's own model** (`test_imagemm.py`, synthetic Eq. 1/10 data with known truth):
+
+| Check | Result |
+|---|---|
+| ⟨DHx, z⟩ = ⟨x, HᵀDᵀz⟩/r²; operators = `conv2d`/`conv_transpose2d` | exact / 6·10⁻⁷ |
+| Monte-Carlo g_σ vs exact pixel integral | 7·10⁻⁵ |
+| Eq. 11: D(h∗g_σ) = f (r = 1, 2, 4; paper reports 3.9·10⁻⁸) | 5·10⁻¹³ (stops at 10⁻⁸·mean f²) |
+| Algorithm 1 loss non-increasing | yes |
+| Algorithm 3: reduced χ² at convergence | 1.012 |
+| Sky noise vs coadd (paper: "virtually none") | σ 19.0 → 0.58 |
+| Star flux vs truth | ×1.003 |
+| Satellite trail, L2 vs Huber | 690 → 0.000 |
+| Algorithm 2 (r = 2): reduced χ² | 0.989 |
+| Tiled vs whole-field restoration | 2.5·10⁻⁵ of peak |
+
+**Stopping rule on real data** (`diag_convergence.py`: M 27, 256² cutout, 271 subs, 1500
+iterations, distances inside the field):
+* **Data fit:** the χ² settles at 1.0835 after about 100 iterations.
+* **Slow tail:** only the brightest star cores keep sharpening after that.
+* **Eq. C15 checks the *mean* of u′ₖ/u′ₖ₋₁.** The paper calls this a necessary condition, and ratios above and below 1 cancel:
+  * at ε = 10⁻⁴ it stops at 14 iterations, 68% of the peak away from the 1500-iteration solution;
+  * at ε = 10⁻⁶ it stops at 185 iterations, max 11%, RMS 0.5%.
+* **The elementwise mean |u′ₖ/u′ₖ₋₁ − 1| < 10⁻⁶** stops at 784 iterations, max 3.5%, RMS 0.2%.
+* **Defaults:** Eq. C15 with ε = 10⁻⁶; the elementwise rule is an option.
+
+**The padding is weakly constrained.** Latent pixels in the corners of the padding are seen
+only through the faintest PSF wings of a few edge pixels, and they can grow without bound
+(3·10⁸ against a field peak of 3·10⁴ in the test). The whole field is therefore restored in
+cutouts that overlap by at least two kernel widths, and each cutout's edge band is discarded
+when blending.
+
+**Additions (not in the paper), each checked against its own reference:**
+* **Biggs & Andrews (1997) acceleration.** Extrapolated steps bring the mean in Eq. C15 to 1
+  about 100× early, so accelerated runs stop at ε/100. Measured against a 5000-iteration
+  solution: 168 instead of 557 iterations, and closer to it (field max 18% vs 39%).
+* **Seeing groups.** Each group is replaced by its inverse-variance coadd with the
+  weight-averaged PSF. When a group shares one PSF, the iterates are identical to using every
+  sub (1·10⁻⁶).
+* **Moffat PSF.** A pixel-integrated elliptical Moffat, fitted by weighted least squares.
+  It recovers the true parameters within 2%.
+* **Noise2Noise pass.** ImageMM is run on the even and on the odd subs separately, and the
+  two are combined by an L2 loss on the linear values (an asinh-domain target would bias
+  faint signal).
+* **Multi-frame loss for the deconvolution network.** ImageMM's Huber likelihood is taken
+  over seeing-group coadds of the other half's subs:
+  * **Kernels:** on the stack grid, with an exact half-pixel alignment for 2× drizzle
+    (centroids within 10⁻⁶ px).
+  * **Check:** with the true sky, the data term equals the noise level (0.97–1.01).
+
+**Held-out benchmark** (`bench_imagemm.py`). Each method restores from the even subs of a
+512² M 27 window; every odd sub is then predicted through its own PSF. The table reports
+the excess of (y − DHx̂)²/v over 1, which is 0 for a perfect restoration. The other columns
+are the paper's Sec. 5.2 and 5.3 metrics (S_F, σ_sky, PSNR/SSIM against the coadd).
+
+| Method | held-out χ² excess, sources (R, G, B) | sky | S_F | σ_sky | iterations, time |
+|---|---|---|---|---|---|
+| Coadd of the even subs (not deconvolved) | 0.224, 0.167, 0.142 | 0.125, 0.082, 0.069 | 8.8–9.7 | 10.2–12.9 | – |
+| **ImageMM, Algorithm 3 (the paper)** | **0.174, 0.122, 0.115** | 0.125, 0.083, 0.069 | 11.0–11.3 | 0.006–0.009 | 168 s |
+| ImageMM, Algorithm 1 (L2) | 0.175, 0.121, 0.113 | 0.125, 0.083, 0.070 | 10.1–10.7 | 0.012–0.020 | 26 s |
+| ImageMM + Biggs–Andrews | 0.174, 0.121, 0.114 | 0.125, 0.083, 0.069 | 11.4–11.6 | 0.001 | 272 s |
+<!-- ROWS -->
+
+**Reading the table.**
+* **Held-out prediction.** ImageMM predicts every held-out sub about 25% better on sources
+  than the coadd does.
+* **Sky.** The sky term is the same for every method. It is a data-level floor (residual
+  per-sub background, variance model), not something the restoration causes.
+* **Photometry.** Measured without annulus subtraction, ImageMM/coadd flux is 1.32 in 8 px
+  apertures, 1.09 at 16 px and 1.04 at 32 px. Most of this is the coadd's seeing halo, which
+  falls outside small apertures while ImageMM gathers it back into the core. The residual
+  +4% at 32 px matches the paper's note that ImageMM concentrates sky-background flux into
+  sources.
+
 ## Literature consulted
 
 * Lehtinen et al. 2018, *Noise2Noise*, arXiv:1803.04189
@@ -138,6 +243,11 @@ which removes it and leaves dark lanes alone.
 * Timofte et al. 2016, *Seven ways to improve example-based SR* (self-ensemble), arXiv:1511.02228
 * AstroSURE 2026, arXiv:2604.16793, and ASTERIS 2026, arXiv:2602.17205 (self-supervised astronomical denoising)
 * Self-supervised single-image deconvolution with Siamese networks, arXiv:2308.09426
+* Sukurdeep, Budavári, Connolly & Navarro 2025, *ImageMM*, arXiv:2501.03002
+* Biggs & Andrews 1997, *Acceleration of iterative image restoration algorithms*, Appl. Opt. 36, 1766
+* Moffat 1969, A&A 3, 455; Trujillo et al. 2001, MNRAS 328, 977 (Moffat PSF)
+* Bertin & Arnouts 1996 (SExtractor; WINPOS centroids, `sep`); Janesick 2007 (photon transfer)
+* Krotkov 1988 (Fourier sharpness S_F)
 
 ## Reproduce
 
@@ -146,6 +256,10 @@ cd experiments
 python exp_denoise.py M27 IC5070 M31
 python exp_deconv.py M27 --methods prod_rl,rl30,n2n_deconv2s_h30_f300_m50
 python viz.py M27 rawA den prod_rl n2n_deconv2s_h30_f300_m50
+python test_imagemm.py                       # ImageMM verification
+python test_exposures.py M27 16              # exposure preparation checks
+python diag_convergence.py M27 256 1500      # stopping rules on real data
+python bench_imagemm.py M27 --size 512 --methods imagemm,imagemm_l2,imagemm_accel,imagemm_moffat,imagemm_g8
 ```
 Method names encode their settings: `_h30` = Hessian 0.30, `_f300` = floor 3.0,
 `_m50` = margin 0.5σ, `2s` = two-stage.

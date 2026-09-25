@@ -15,6 +15,12 @@ Two resampling modes:
                    mask are warped separately and combined as a normalised
                    convolution – no demosaic interpolation, better colour
                    resolution, needs a reasonable number of dithered frames.
+PSF groups (``psf_groups`` > 1) split pass 3 further by seeing: frames are
+ranked by FWHM and cut into groups of equal total weight, each accumulated
+per parity.  These sub-stacks are the multi-exposure input of the ImageMM
+restoration (astrophoto/imagemm.py): every group has its own PSF.  The halves
+and the full stack are their sums, so nothing else changes.
+
 Optional output ``scale`` (e.g. 1.5, 2) produces an up-sampled (drizzle-like)
 integration that exploits the sub-pixel dithering/rotation between frames.
 """
@@ -112,7 +118,7 @@ class Integrator:
     def __init__(self, infos: list[FrameInfo], analysis: dict, defects: np.ndarray | None,
                  mode: str = "auto", scale: float = 1.0, sigma_low: float = 4.0,
                  sigma_high: float = 3.0, local_norm: bool = True, workers: int | None = None,
-                 progress=None, cancel=None):
+                 progress=None, cancel=None, psf_groups: int = 0, unit_sink=None):
         frames = analysis["frames"]
         self.items = [(info, fr) for info, fr in zip(infos, frames) if fr["accepted"] and fr["weight"] > 0]
         if not self.items:
@@ -137,8 +143,29 @@ class Integrator:
         self.cancel = cancel or (lambda: False)
         self.grid = analysis["grid"]
         self._masks = cfa_masks(self.pattern, (self.H0, self.W0)) if mode == "drizzle" else None
+        self.groups, self.group_info = self._psf_groups(int(psf_groups))
+        self.unit_sink = unit_sink
         self.offsets: dict[int, np.ndarray] = {}
         self.gradients: dict[int, np.ndarray] = {}
+
+    def _psf_groups(self, n_groups: int):
+        """Assign every frame to a seeing class: equal total weight per class, sharpest first."""
+        n = len(self.items)
+        n_groups = min(n_groups, n // 6)
+        if n_groups < 2:
+            return np.zeros(n, int), []
+        fw = np.array([fr.get("fwhm", np.nan) for _, fr in self.items], float)
+        fw = np.where(np.isfinite(fw), fw, np.nanmax(fw) if np.isfinite(fw).any() else 1.0)
+        wt = np.array([fr["weight"] for _, fr in self.items], float)
+        order = np.argsort(fw, kind="stable")
+        mid = (np.cumsum(wt[order]) - 0.5 * wt[order]) / wt.sum()
+        groups = np.empty(n, int)
+        groups[order] = np.minimum((mid * n_groups).astype(int), n_groups - 1)
+        info = [{"n_frames": int((groups == g).sum()), "weight": float(wt[groups == g].sum() / wt.sum()),
+                 "fwhm_median": float(np.median(fw[groups == g])),
+                 "fwhm_range": [float(fw[groups == g].min()), float(fw[groups == g].max())]}
+                for g in range(n_groups)]
+        return groups, info
 
     # ------------------------------------------------------------------ frames
     def _warp(self, idx: int):
@@ -303,10 +330,11 @@ class Integrator:
         np.maximum(sd, sd_floor, out=sd)
 
         # ---- pass 3: sigma-clipped integration into two half stacks
-        SA = np.zeros((H, W, 3), np.float32)
-        WA = np.zeros((H, W, 3), np.float32)
-        SB = np.zeros((H, W, 3), np.float32)
-        WB = np.zeros((H, W, 3), np.float32)
+        # one (sum, weight) accumulator per PSF group and parity; without groups
+        # that is exactly the two half stacks
+        G = int(self.groups.max()) + 1
+        units = [[(np.zeros((H, W, 3), np.float32), np.zeros((H, W, 3), np.float32)) for _ in range(2)]
+                 for _ in range(G)]
         rejected = np.zeros((H, W), np.uint16)
         clip = n >= 5
         r = np.empty((H, W, 3), np.float32)
@@ -322,12 +350,26 @@ class Integrator:
                 bad |= r < -self.sigma_low
                 wts[bad] = 0
                 rejected += bad.any(-1) & valid
-            acc_s, acc_w = (SA, WA) if k % 2 == 0 else (SB, WB)
+            acc_s, acc_w = units[self.groups[k]][k % 2]
             acc_w += wts
             vals *= wts
             acc_s += vals
             self.progress(k + 1, n, f"Integration pass 3/3 ({k + 1}/{n})")
         del r, sd
+        if G > 1 and self.unit_sink is not None:
+            for g in range(G):
+                for par in range(2):
+                    S_, W_ = units[g][par]
+                    self.unit_sink(g, par, S_, W_)
+        # fold the groups into the two halves, freeing each group as it is added
+        (SA, WA), (SB, WB) = units[0]
+        for g in range(1, G):
+            for (S_, W_), (acc_s, acc_w) in zip(units[g], ((SA, WA), (SB, WB))):
+                acc_s += S_
+                acc_w += W_
+            units[g] = None
+        del units
+        S_ = W_ = acc_s = acc_w = None
         Wtot = WA + WB
         full = SA + SB
         full /= np.maximum(Wtot, 1e-6)
@@ -350,4 +392,5 @@ class Integrator:
             "scale": self.scale,
             "n_frames": n,
             "total_exposure": float(sum(info.exptime for info, _ in self.items)),
+            "psf_groups": self.group_info,
         }

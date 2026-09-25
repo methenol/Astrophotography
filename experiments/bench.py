@@ -30,6 +30,9 @@ DATASETS = {
     "IC5070": "output/IC_5070_sub-a9642d",
     "M27": "output/M_27_sub-2c99a3",
     "M31": "output/M_31_sub-44e3ac",
+    # re-stacked with psf_groups=3 for the ImageMM experiments (exp_imagemm.py)
+    "IC5070g": "experiments/cache/stacks/IC_5070_sub-a9642d",
+    "M27g": "experiments/cache/stacks/M_27_sub-2c99a3",
 }
 BAND = 256          # width of train / test bands
 CROP = 1536         # benchmark crop (per side) at 1x; scaled for drizzled stacks
@@ -56,7 +59,7 @@ def load(name: str, crop: int | None = None):
     a = _fits(os.path.join(d, "half_a.fits"))[sl].copy()
     b = _fits(os.path.join(d, "half_b.fits"))[sl].copy()
     full = _fits(os.path.join(d, "stack.fits"))[sl].copy()
-    return dict(name=name, a=a, b=b, full=full, cov=cov[sl].copy(), sat=meta["saturation"],
+    return dict(name=name, dir=d, sl=sl, a=a, b=b, full=full, cov=cov[sl].copy(), sat=meta["saturation"],
                 scale=meta.get("scale", 1.0), filter=meta.get("filter", ""))
 
 
