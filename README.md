@@ -94,6 +94,70 @@ fill the finer grid evenly. Stacking parallelism is limited automatically to fit
 raise it with `ASTROPHOTO_STACK_RAM_GB=6` on bigger machines. The export **Upscale** option is only
 interpolation. Use Super-resolution for real detail.
 
+## Explore: what else is in your image
+
+The **Explore** tab identifies everything catalogued in the field. It plate-solves the stack
+against **Gaia DR3**:
+
+- Star triangles are matched to the catalogue (astroalign), trying both mirror orientations.
+- A TAN-SIP world-coordinate solution is then fitted to thousands of matched stars
+  (`astropy.wcs.utils.fit_wcs_from_points`), at about 0.3″ rms on M 27.
+- Positions are propagated from Gaia's 2016.0 epoch to the night of observation.
+
+It then looks up every **SIMBAD** object in the field. The results show in three views:
+**Overlay** (markers on the processed image), **Side by side** (image next to a star map, with
+pan and zoom linked) or **Star map**.
+
+Hover over any star or object for a pop-out. It shows:
+
+- the object's type, with a short explanation
+- brightness compared with the naked-eye limit
+- colour and surface temperature, noting when interstellar dust has reddened it
+- distance from the Gaia parallax, which is also how many years ago its light left it
+- luminosity relative to the Sun, corrected for dust
+- motion across the sky
+- for galaxies: redshift, lookback time and physical size (Planck 2018 cosmology)
+
+Links go to SIMBAD, Wikipedia and Gaia. The side panel gives the field's constellation,
+size, orientation and depth, and a searchable list of named objects, galaxies, nebulae and
+variable or double stars. Click a list entry to fly to it.
+
+Plate solving needs an internet connection once per stack; the catalogues are cached in
+the session folder (`explore/`).
+
+## Experiments (Optuna)
+
+The **Experiments** tab tunes the pipeline with [Optuna](https://optuna.org) studies. For
+each study you choose:
+
+- an experiment: ImageMM restoration, the Noise2Noise denoiser, the N2N restoration
+  network, or registration & integration
+- a dataset: a stacked real session, or a **synthetic** one generated in the tab
+- which parameters to tune, and over what ranges
+- one or two objectives
+- a sampler: multivariate TPE, NSGA-II, random or grid
+
+Each study runs as its own background process, so several can run at once on different
+GPUs. While it runs you see the optimisation history, Pareto front, fANOVA parameter
+importances, slice plots, a trials table with a preview of every result in one shared
+stretch, and the log. Trial 0 is the pipeline's current settings, so every result is shown
+as a change from the baseline. Stop a study, continue it with more trials, or apply its
+best trial to the pipeline: from the study itself, or with **From experiment** in
+*Integration & compute options*.
+
+How results are scored:
+
+- **Real data** is scored on held-out data only, never on data the method saw:
+  - restorations: the odd subs, predicted through each one's own PSF
+  - the denoiser: the independent half-stack, on held-out bands
+- **Synthetic datasets** are Seestar-format raw subs of an analytic sky (stars, nebulae,
+  galaxies) with the same held-out scores, plus comparison against the exact truth: error,
+  SSIM, faint-emission error and star photometry. Each sub has its own dither, field
+  rotation, Moffat seeing, transparency, sky gradient, shot and read noise, hot pixels,
+  satellite trails and cosmic rays.
+
+Details: [experiments/README.md](experiments/README.md#experiment-lab-optuna).
+
 ## Research & benchmarks
 
 `experiments/` holds the harness used to choose the ML models. It scores every

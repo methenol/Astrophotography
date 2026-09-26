@@ -103,59 +103,8 @@ def run_network(sess, es, window, groups, dev):
     return sharp_a - es.sky_ref[y0:y1, x0:x1]
 
 
-def sharpness(img):
-    """S_F (Krotkov 1988): log magnitude of the 2-D Fourier transform, averaged over frequencies."""
-    return float(np.mean(np.log(np.abs(np.fft.fft2(img)) + 1e-12)))
-
-
-def sky_sigma(img):
-    return float(sep.Background(np.ascontiguousarray(img, np.float32)).globalrms)
-
-
-def photometry(coadd, img, thresh):
-    L = np.ascontiguousarray(coadd, np.float32)
-    objs = sep.extract(L, thresh)
-    kr, _ = sep.kron_radius(L, objs["x"], objs["y"], objs["a"], objs["b"], objs["theta"], 6.0)
-    r = 2.5 * np.maximum(kr, 1.0)
-    fc, _, _ = sep.sum_ellipse(L, objs["x"], objs["y"], objs["a"], objs["b"], objs["theta"], r)
-    fi, _, _ = sep.sum_ellipse(np.ascontiguousarray(img, np.float32), objs["x"], objs["y"], objs["a"], objs["b"],
-                               objs["theta"], r)
-    ok = (fc > 0) & (fi > 0)
-    mc = -2.5 * np.log10(fc[ok])
-    dm = -2.5 * np.log10(fi[ok]) - mc
-    return mc, dm
-
-
-def heldout_chi2(es, idx_b, x, r, kernels_b, window, smask, device):
-    """Mean of (y - D H x)^2 / v - 1 over held-out exposures, per channel, sky / sources."""
-    y0, y1, x0, x1 = window
-    Y, V, Mk = es.windows(idx_b, y0, y1, x0, x1)
-    ks = kernels_b.shape[-1]
-    X, Yl = M.latent_shape(y1 - y0, x1 - x0, ks, r)
-    o = int(round(M.exposure_origin(ks, r)))
-    # embed the latent estimate (defined on the window) into the padded latent; outside the
-    # window, continue it by edge replication (only the outer PSF radius is affected, which
-    # is excluded below)
-    xt = torch.from_numpy(np.ascontiguousarray(np.moveaxis(x, -1, 0)))[None].to(device)
-    xl = torch.nn.functional.pad(xt, (o, Yl - xt.shape[-1] - o, o, X - xt.shape[-2] - o), mode="replicate")
-    ops = M.Operators(torch.from_numpy(kernels_b).to(device), r)
-    res = {"sky": [], "src": []}
-    edge = (ks // r) + 2
-    inner = np.zeros((y1 - y0, x1 - x0), bool)
-    inner[edge:-edge, edge:-edge] = True
-    for a, b in ops.ranges():
-        fx = ops.forward(xl, a, b).cpu().numpy()
-        z = (Y[a:b] - fx) ** 2 / V[a:b]
-        m = (Mk[a:b] > 0) & inner[None, None]
-        for key, sel in (("sky", ~smask), ("src", smask)):
-            mm = m & sel[None, None]
-            res[key].append((np.where(mm, z, 0).sum((0, 2, 3)), mm.sum((0, 2, 3))))
-    out = {}
-    for key, lst in res.items():
-        s = sum(q[0] for q in lst)
-        n = sum(q[1] for q in lst)
-        out[key] = (s / np.maximum(n, 1) - 1).round(4).tolist()
-    return out
+# the metrics are shared with the experiment lab (Experiments tab)
+from astrophoto.lab.metrics import heldout_chi2, photometry, sharpness, sky_sigma  # noqa: E402,F401
 
 
 def main():

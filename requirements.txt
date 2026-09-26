@@ -9,6 +9,9 @@ scikit-learn>=1.5
 opencv-python-headless>=4.10
 pillow>=10.0
 tifffile>=2024.1
+# Explore tab (plate solving, Gaia / SIMBAD) and the experiment lab
+astroquery>=0.4.7
+optuna>=4.0
 # ML denoiser (install the CUDA build on NVIDIA machines — see README)
 torch>=2.3
 # Web UI

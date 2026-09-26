@@ -149,17 +149,20 @@ def _to_t(img: np.ndarray) -> torch.Tensor:
 
 
 def train_n2n(ga: np.ndarray, gb: np.ndarray, iters: int = 2000, patch: int = 128, batch: int = 16,
-              device=None, progress=None, cancel=None, seed: int = 0, sample_mask: np.ndarray | None = None) -> UNet:
+              device=None, progress=None, cancel=None, seed: int = 0, sample_mask: np.ndarray | None = None,
+              max_lr: float = 1e-3, base: int = 32) -> UNet:
+    """Noise2Noise (Lehtinen et al. 2018) U-Net on the stabilised half-stacks; one-cycle
+    schedule (Smith & Topin 2019) peaking at ``max_lr``; ``base`` = first-level channels."""
     device = device or pick_device()
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
-    net = UNet().to(device)
+    net = UNet(base=base).to(device)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
     use_scaler = device.type == "cuda" and not torch.cuda.is_bf16_supported()
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     opt = torch.optim.Adam(net.parameters(), lr=3e-4)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=1e-3, total_steps=iters, pct_start=0.15)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=max_lr, total_steps=iters, pct_start=0.15)
     h, w, _ = ga.shape
     ta, tb = torch.from_numpy(ga.transpose(2, 0, 1)).contiguous(), torch.from_numpy(gb.transpose(2, 0, 1)).contiguous()
     # candidate patch corners: only where the patch is inside well-covered data

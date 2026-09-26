@@ -284,6 +284,87 @@ estimator:
 On a synthetic field it matches the true PSF to 0.2% of the peak. On M 27 it leaves 4–11%
 beyond 8 px, and it improved the held-out score (0.174/0.122/0.115 before).
 
+## Experiment lab (Optuna)
+
+The scripts above are one-off comparisons. The **Experiments** tab of the web UI
+(`astrophoto/lab/`) turns every tunable part into an Optuna study (Akiba et al. 2019). You
+can configure, run, monitor and review a study there, or from the command line:
+
+```bash
+python -m astrophoto.lab.generate output/lab/synthetic/<name>     # needs <name>/spec.json
+python -m astrophoto.lab.run output/lab/studies/<study>           # needs <study>/config.json
+```
+
+### Tasks (`astrophoto/lab/tasks.py`)
+
+Each task declares:
+
+- its parameters: the range, the pipeline default and the pipeline setting each maps to
+- its metrics, each with a direction
+- `prepare` (shared loading, once per study) and `run` (one trial)
+
+| Task | One trial | Real-data score | Synthetic data also |
+|---|---|---|---|
+| `imagemm` | ImageMM on a window, from the even subs | held-out χ² excess on the odd subs through their own PSFs (source / sky), S_F, σ_sky, SSIM vs coadd | truth at r = 1: the sky integrated over pixels; at r > 1, or with g_σ: the sky through g_σ |
+| `denoise` | N2N U-Net on the half-stacks (steps, peak learning rate, patch, batch, width, self-ensemble) | half-B error on held-out bands, linear and stretched (× noise variance; 1 = raw) | truth seen through the subs' weighted mean PSF |
+| `network` | N2N denoiser + deconvolution network, window held out of training | as `imagemm` | as `imagemm` |
+| `stack` | re-stack in the study folder (rejection σ, local normalisation, resampling, scale, sensitivity) | background noise and star FWHM, both in native pixels | truth through the subs' mean PSF |
+
+The `denoise` task exposes the peak learning rate and patch size. This is the place to
+test whether 2× drizzled stacks want a different schedule; their N2N loss converges to a
+larger share of irreducible noise, so their loss curve is flatter even when training works.
+
+### Truth metrics (`metrics.truth_metrics`)
+
+Both the result and the truth are smoothed to a common resolution σ_eval. A per-channel
+plane (the sky background and its gradient, which are not part of the truth) is removed
+from the difference. Then:
+
+- nrmse: rms error / rms of the true structure
+- PSNR
+- SSIM: of the asinh-stretched images
+- faint_nrmse: nrmse where the true stars are negligible
+- star photometry: of isolated, unsaturated true stars, with the true extended emission
+  removed and the true stars in the same aperture
+
+### Synthetic data (`astrophoto/lab/synthetic.py`)
+
+The sky is analytic, and its components are evaluated exactly:
+
+- stars from a power-law luminosity function with blackbody colours
+- Gaussian clouds and filaments, a planetary-nebula shell, Sérsic galaxies
+
+Rendering:
+
+- Each sub has its own geometry (dither, field rotation) and an elliptical Moffat PSF.
+- Extended emission is integrated over pixels by midpoint quadrature on a 3 × 3 sub-grid
+  and convolved by FFT.
+- Stars are exact stamps at their true positions.
+- The image is then mosaicked through the Bayer pattern, with Poisson and read noise, a
+  bias and 16-bit clipping.
+
+Checked:
+
+- a single star keeps its flux and lands within 0.0002 px of its true position, at 1× and 2×
+- extended flux is conserved through the PSF and at 2×
+- the pipeline's stack of a synthetic set matches the rendered truth to 0.05 px
+- the nebula gain equals the pipeline's photometric convention (subs divided by their
+  transparency relative to the median sub), which is the convention `truth_image` uses
+
+### Storage and review
+
+A study lives in `output/lab/studies/<id>/`:
+
+- `config.json`
+- `study.db`: Optuna's SQLite storage, with every metric of every trial kept as a user
+  attribute
+- `status.json`, `log.txt`
+- `trials/<n>.jpg`: one stretch for the whole study
+
+Trial 0 is the pipeline's current setting. The "best" trial is the optimum of a single
+objective. With two objectives, it is the Pareto-optimal trial that is best on the first.
+That trial is what *From experiment* applies to the pipeline settings.
+
 ## Literature consulted
 
 * Lehtinen et al. 2018, *Noise2Noise*, arXiv:1803.04189
@@ -299,6 +380,11 @@ beyond 8 px, and it improved the held-out score (0.174/0.122/0.115 before).
 * Moffat 1969, A&A 3, 455; Trujillo et al. 2001, MNRAS 328, 977 (Moffat PSF)
 * Bertin & Arnouts 1996 (SExtractor; WINPOS centroids, `sep`); Janesick 2007 (photon transfer)
 * Krotkov 1988 (Fourier sharpness S_F)
+* Akiba et al. 2019, *Optuna* (KDD); Bergstra et al. 2011 / Falkner et al. 2018 (TPE); Deb et al. 2002 (NSGA-II);
+  Hutter et al. 2014 (fANOVA importances)
+* Wang et al. 2004 (SSIM); Ciotti & Bertin 1999 (Sérsic b_n)
+* Gaia Collaboration 2023, A&A 674, A1 (Gaia DR3); Wenger et al. 2000 (SIMBAD); Beroiz et al. 2020 (astroalign);
+  Pecaut & Mamajek 2013 (spectral classes); Planck Collaboration 2020 (cosmology)
 
 ## Reproduce
 

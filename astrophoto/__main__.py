@@ -53,6 +53,10 @@ def main(argv=None):
     r.add_argument("--imagemm-sigma", type=float, default=STACK_DEFAULTS["imagemm_sigma"],
                    help="g_sigma of Eq. 11 in latent pixels (0: none for r=1, 1.1 for r>1)")
     r.add_argument("--imagemm-l2", action="store_true", help="L2 loss (Algorithm 1/2) instead of Huber (Algorithm 3)")
+    r.add_argument("--imagemm-delta", type=float, default=STACK_DEFAULTS["imagemm_delta"],
+                   help="Huber threshold delta (Algorithm 3)")
+    r.add_argument("--imagemm-kappa", type=float, default=STACK_DEFAULTS["imagemm_kappa"],
+                   help="clipping of the multiplicative update")
     r.add_argument("--imagemm-epsilon", type=float, default=STACK_DEFAULTS["imagemm_epsilon"], help="stopping tolerance")
     r.add_argument("--imagemm-stop", default=STACK_DEFAULTS["imagemm_stop"], choices=["c15", "elementwise"],
                    help="stopping rule: Eq. C15 (the paper) or elementwise mean |u'_k/u'_k-1 - 1|")
@@ -115,6 +119,7 @@ def main(argv=None):
              "deconv_method": "none" if args.no_ai_deconv else args.deconv,
              "imagemm_r": args.imagemm_r, "imagemm_sigma": args.imagemm_sigma, "imagemm_robust": not args.imagemm_l2,
              "imagemm_epsilon": args.imagemm_epsilon, "imagemm_stop": args.imagemm_stop,
+             "imagemm_delta": args.imagemm_delta, "imagemm_kappa": args.imagemm_kappa,
              "imagemm_max_iters": args.imagemm_max_iters,
              "imagemm_psf": args.imagemm_psf, "imagemm_groups": args.imagemm_groups,
              "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,

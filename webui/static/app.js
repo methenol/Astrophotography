@@ -130,6 +130,7 @@ async function openDataset(folder) {
   try {
     const r = await api("/api/open", { method: "POST", body: { folder } });
     S.folder = folder; store.set("lastFolder", folder);
+    if (typeof Explore !== "undefined") Explore.reset();
     S.status = r.status; S.frames = r.frames;
     S.params = { ...currentDefaults(), ...store.get("params:" + folder, {}) };
     applyParamsToUI();
@@ -149,6 +150,33 @@ function updateSteps() {
   $("#step-denoise").classList.toggle("done", !!st.denoised);
 }
 
+/* ------------------------------------------------------------ settings from an experiment */
+let EXPERIMENTS = [];
+async function loadExperimentChoices() {
+  try { EXPERIMENTS = (await api("/api/lab/best")).studies; } catch { return; }
+  const sel = $("#sp-experiment"), cur = sel.value;
+  const f = v => typeof v === "number" ? +v.toPrecision(4) : v;
+  sel.innerHTML = `<option value="">—</option>` + EXPERIMENTS.map(e =>
+    `<option value="${e.id}">${e.name} · ${e.task_label} · trial #${e.trial} (${e.objectives.map((o, i) => `${o.metric} ${f(e.values[i])}`).join(", ")})${e.state === "running" ? " · still running" : ""}</option>`).join("");
+  if (EXPERIMENTS.some(e => e.id === cur)) sel.value = cur;
+}
+function applyExperiment(id) {
+  const e = EXPERIMENTS.find(x => x.id === id);
+  if (!e) { $("#sp-experiment-info").textContent = ""; return; }
+  const set = [];
+  for (const [k, v] of Object.entries(e.settings)) {
+    const el = $("#sp-" + k); if (!el) continue;
+    if (el.type === "checkbox") el.checked = !!v; else el.value = String(v);
+    if (k === "deconv_method") el.dispatchEvent(new Event("change", { bubbles: true }));
+    set.push(`${k} = ${v}`);
+  }
+  const other = Object.entries(e.not_pipeline || {}).map(([k, v]) => `${k} = ${v}`);
+  $("#sp-experiment-info").innerHTML = `Applied trial #${e.trial} of “${e.name}” (${e.criterion}) on ${e.dataset}: ${set.join(", ")}.` +
+    (other.length ? ` Not pipeline settings (not applied): ${other.join(", ")}.` : "") + " Re-run the step to use them.";
+  toast(`Settings of “${e.name}” applied`);
+}
+document.addEventListener("change", e => { if (e.target.id === "sp-experiment") applyExperiment(e.target.value); });
+
 /* ------------------------------------------------------------ jobs */
 // ImageMM options only matter for the ImageMM restoration
 document.addEventListener("change", e => {
@@ -164,6 +192,7 @@ function stackParams() {
     imagemm_r: parseInt(g("imagemm_r").value), imagemm_sigma: parseFloat(g("imagemm_sigma").value) || 0,
     imagemm_robust: g("imagemm_robust").checked, imagemm_epsilon: parseFloat(g("imagemm_epsilon").value) || 1e-6,
     imagemm_stop: g("imagemm_stop").value,
+    imagemm_delta: parseFloat(g("imagemm_delta").value) || 2, imagemm_kappa: parseFloat(g("imagemm_kappa").value) || 2,
     imagemm_max_iters: parseInt(g("imagemm_max_iters").value) || 1000, imagemm_psf: g("imagemm_psf").value,
     imagemm_groups: parseInt(g("imagemm_groups").value) || 0, imagemm_accelerate: g("imagemm_accelerate").checked,
     imagemm_n2n: g("imagemm_n2n").checked, network_groups: parseInt(g("network_groups").value) || 0,
@@ -400,6 +429,8 @@ function switchTab(name) {
   $$(".tabpane").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
   if (name === "process") setTimeout(fitView, 50);
   if (name === "diag") refreshDiag();
+  if (name === "explore") setTimeout(() => Explore.show(), 30);
+  if (name === "lab") Lab.show();
 }
 
 /* ------------------------------------------------------------ bindings */
@@ -429,6 +460,8 @@ function bindUI() {
   sps.nextElementSibling.textContent = "1.0";
   const q = $("#ex-quality"); q.oninput = () => (q.nextElementSibling.textContent = q.value);
   bindViewer();
+  loadExperimentChoices();
+  $(".sidebar details.adv").addEventListener("toggle", ev => { if (ev.target.open) loadExperimentChoices(); });
 }
 
 init().catch(e => toast(e.message, true));

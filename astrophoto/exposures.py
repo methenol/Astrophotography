@@ -539,6 +539,12 @@ class ExposureSet:
                 break
         final = refine_registration(y.mean(-1), hard, self.cat, fwhm, self.W0, self.H0)
         T, T_err = aperture_ratio(y, self.ref, hard, self.cat, radius=3.0 * max(fwhm, self.fwhm_ref))
+        if not np.all(np.isfinite(T)):
+            # no photometric scale in some channel (too few isolated stars at SNR >= 50): the
+            # exposure cannot be placed in the model; usable() leaves it out
+            return {"refine": refine, "residual": final, "T": T, "T_err": T_err, "surf": None, "psf": [None] * 3,
+                    "psf_err": [None] * 3, "psf_stars": [0, 0, 0], "fwhm": fwhm, "valid_frac": float(valid.mean()),
+                    "_y": None}
         e = y / T[None, None, :] - self.ref
         coefs = fit_smooth_surface(e, valid & ~self.smask, deg=2)
         surf = eval_surface(coefs, self.H0, self.W0)
@@ -577,9 +583,12 @@ class ExposureSet:
                 if nxt < n:
                     futs.append(ex.submit(self.prepare_one, nxt))
                     nxt += 1
-                if prev is not None:
-                    self._ptc_pair(prev, p, acc)
-                prev = {kk: p[kk] for kk in ("_y", "_valid", "_surf", "T")}
+                if p["_y"] is None:                  # not usable: no photometric scale
+                    prev = None
+                else:
+                    if prev is not None:
+                        self._ptc_pair(prev, p, acc)
+                    prev = {kk: p[kk] for kk in ("_y", "_valid", "_surf", "T")}
                 self.params[k] = {kk: v for kk, v in p.items() if not kk.startswith("_")}
                 if progress:
                     progress(k + 1, n, f"ImageMM: preparing exposures {k + 1}/{n}")
@@ -618,12 +627,18 @@ class ExposureSet:
     @staticmethod
     def _ptc_fit(acc: dict) -> dict:
         from scipy.optimize import nnls
+        if not acc["X"]:
+            raise RuntimeError("photon-transfer calibration impossible: no two consecutive usable exposures "
+                               "(each needs a photometric scale from >= 3 isolated stars at SNR >= 50 in every "
+                               "channel) with enough star-free pixels")
         X = np.array(acc["X"], float)
         v = np.array(acc["v"], float)
         n = np.array(acc["n"], float)
         c0, c1, red = np.zeros(3), np.zeros(3), np.zeros(3)
         for c in range(3):
             s = X[:, 0] == c
+            if s.sum() < 2:
+                raise RuntimeError(f"photon-transfer calibration impossible in channel {c}: too few level bins")
             A = X[s, 1:]
             y = v[s]
             w = np.sqrt(n[s] / 2) / np.maximum(y, 1e-12)        # sd of a variance estimate ~ var sqrt(2/n)
@@ -658,7 +673,8 @@ class ExposureSet:
 
     def usable(self) -> list[int]:
         """Exposures with a PSF in every channel (the model needs f(t))."""
-        return [k for k, p in enumerate(self.params) if p is not None and all(q is not None for q in p["psf"])]
+        return [k for k, p in enumerate(self.params) if p is not None and all(q is not None for q in p["psf"])
+                and np.all(np.isfinite(p["T"]))]
 
     def moffat_psfs(self):
         """Fit the Moffat model to every exposure's empirical PSFs (``fit_moffat``)."""

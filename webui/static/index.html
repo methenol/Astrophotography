@@ -37,6 +37,8 @@
 
       <details class="adv">
         <summary>Integration &amp; compute options</summary>
+        <label title="Apply the pipeline settings of an experiment's best trial (Experiments tab). Single objective: the trial with the best value; two objectives: the Pareto-optimal trial that is best on the first. Every setting the trial ran with is applied, tuned or held fixed.">From experiment <select id="sp-experiment"><option value="">—</option></select></label>
+        <div id="sp-experiment-info" class="muted small"></div>
         <label>Resampling <select id="sp-mode"><option value="auto">auto</option><option value="drizzle">Bayer drizzle</option><option value="demosaic">Demosaic + Lanczos</option></select></label>
         <label title="Multi-frame super-resolution: every sub is shifted/rotated slightly differently, so the stack samples the sky on a finer grid than one frame. Measured on M 27: 7.7&quot; → 6.5&quot; star FWHM at 2×. Needs ~50+ subs; ~4× slower stacking and 4× larger files.">Super-resolution <select id="sp-scale"><option value="1">Off (native)</option><option value="1.5">1.5× drizzle</option><option value="2">2× drizzle (recommended ≥50 subs)</option></select></label>
         <label>Rejection sensitivity <input id="sp-sensitivity" type="range" min="0.5" max="2" step="0.1" value="1"><output></output></label>
@@ -50,6 +52,8 @@
         <label title="Standard deviation (latent pixels) of the Gaussian g_sigma in Eq. 11: the latent image is the sky seen through g_sigma. 0 = none at 1×; the paper uses 1.1 at 2× and 1 at 1×.">g<sub>σ</sub> (px) <input id="sp-imagemm_sigma" type="number" step="0.1" min="0" value="0"></label>
         <label class="check" title="Algorithm 3: Huber M-estimator (delta = 2), robust to satellite trails and other outliers. Off: the plain L2 likelihood (Algorithm 1/2).">
           <input id="sp-imagemm_robust" type="checkbox" checked> Robust (Huber)</label>
+        <label title="Huber threshold δ of Algorithm 3, in units of each pixel's noise σ: residuals beyond δσ are down-weighted. The paper uses 2.">Huber δ <input id="sp-imagemm_delta" type="number" step="0.1" min="0.1" value="2"></label>
+        <label title="Clipping κ of the multiplicative update (Eqs. 7–9): each iteration changes a pixel by at most ×κ or ÷κ. The paper uses 2.">Update clip κ <input id="sp-imagemm_kappa" type="number" step="0.1" min="1.01" value="2"></label>
         <label title="When to stop. Eq. C15 (the paper): the mean of u′k/u′k−1 over the effective mask is within ε of 1 — a necessary condition; ratios above and below 1 can cancel. Elementwise: the mean of |u′k/u′k−1 − 1| is below ε. Measured on M 27 at ε = 1e-6: 185 vs 784 iterations; distance from a 1500-iteration solution max 11 % vs 3.5 % of the peak (at the brightest star cores), rms 0.5 % vs 0.2 %.">Stopping rule <select id="sp-imagemm_stop"><option value="c15">Eq. C15 (paper)</option><option value="elementwise">Elementwise</option></select></label>
         <label title="Stopping tolerance ε (the paper uses 1e-4 … 1e-6).">Tolerance ε <input id="sp-imagemm_epsilon" type="number" step="any" min="0" value="0.000001"></label>
         <label title="Maximum number of iterations K.">Max iterations <input id="sp-imagemm_max_iters" type="number" step="100" min="10" value="1000"></label>
@@ -78,8 +82,10 @@
     <nav class="tabs">
       <button class="tab active" data-tab="process">Process</button>
       <button class="tab" data-tab="frames">Frames <span id="framesCount" class="pill"></span></button>
+      <button class="tab" data-tab="explore">Explore</button>
       <button class="tab" data-tab="export">Export</button>
       <button class="tab" data-tab="diag">Diagnostics</button>
+      <button class="tab" data-tab="lab">Experiments</button>
     </nav>
 
     <!-- PROCESS -->
@@ -147,6 +153,51 @@
       </div>
     </section>
 
+    <!-- EXPLORE -->
+    <section class="tabpane" id="tab-explore">
+      <div class="explore">
+        <div class="viewer">
+          <div class="viewer-toolbar">
+            <div class="seg" id="exMode">
+              <button class="segbtn active" data-exmode="overlay">Overlay</button>
+              <button class="segbtn" data-exmode="side">Side by side</button>
+              <button class="segbtn" data-exmode="chart">Star map</button>
+            </div>
+            <div class="seg">
+              <button class="segbtn" id="exFit">Fit</button>
+              <select id="exSize" title="image resolution"><option value="1400">Fast</option><option value="2400" selected>Detailed</option><option value="full">Full resolution</option></select>
+            </div>
+            <label class="small muted exrange" title="Opacity of the markers drawn over the image">Markers <input id="exOpacity" type="range" min="0" max="1" step="0.05" value="0.85"></label>
+            <label class="small muted exrange" title="Faintest Gaia star drawn (G magnitude)">Stars to G <input id="exMag" type="range" min="6" max="16" step="0.5" value="13"><output id="exMagOut">13</output></label>
+            <span id="exCursor" class="muted small excursor"></span>
+          </div>
+          <div class="exstage" id="exStage">
+            <canvas id="exImg"></canvas>
+            <canvas id="exChart" hidden></canvas>
+            <div class="placeholder" id="exPlaceholder">
+              <div class="ph-inner">
+                <div class="big">✦</div>
+                <p id="exPhText">Stack a dataset, then plate-solve it to explore what else is in the image.</p>
+                <button class="btn primary" id="exSolve" hidden>Identify objects in this image</button>
+                <p class="muted small" id="exSolveNote" hidden>Matches the stars against Gaia DR3 to find exactly where the image points, then
+                  looks up every catalogued object in the field in SIMBAD (internet connection needed once; the results are cached).</p>
+              </div>
+            </div>
+            <div class="spinner" id="exSpinner" hidden></div>
+            <div class="expop" id="exPop" hidden></div>
+          </div>
+        </div>
+        <aside class="expanel">
+          <div class="card" id="exField"><h3>Field</h3><div class="muted small">Not solved yet.</div></div>
+          <div class="card"><h3>Layers</h3><div id="exLayers" class="exlayers"></div></div>
+          <div class="card grow"><h3>In this image</h3>
+            <input id="exSearch" type="text" placeholder="Search names, types…">
+            <div id="exList" class="exlist"></div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
     <!-- EXPORT -->
     <section class="tabpane" id="tab-export">
       <div class="export-grid">
@@ -174,9 +225,55 @@
         <div class="card"><h3>Stack &amp; processing info</h3><pre id="diagInfo" class="small"></pre></div>
       </div>
     </section>
+
+    <!-- EXPERIMENTS -->
+    <section class="tabpane" id="tab-lab">
+      <div class="lab">
+        <div class="labform">
+          <div class="card">
+            <h3>New study</h3>
+            <label class="lf">Name <input id="lbName" type="text" placeholder="e.g. imagemm-huber-m27"></label>
+            <label class="lf">Experiment <select id="lbTask"></select></label>
+            <p id="lbTaskDesc" class="muted small"></p>
+            <label class="lf">Dataset <select id="lbData"></select></label>
+            <details id="lbSynth" class="adv"><summary>New synthetic dataset…</summary>
+              <p class="muted small">Renders Seestar-format raw subs of an analytic sky (stars, nebula, galaxies) with known truth: per-sub dither, field rotation, Moffat seeing, transparency, sky gradient, Poisson + read noise, hot pixels, satellite trails and cosmic rays. It is then analysed and stacked with the pipeline defaults.</p>
+              <div id="lbSynthFields" class="lbgrid"></div>
+              <button class="btn small" id="lbSynthGo">Generate</button>
+            </details>
+            <div id="lbOptions" class="lbgrid"></div>
+          </div>
+          <div class="card">
+            <h3>Search space</h3>
+            <p class="muted small">Tick a parameter to tune it; otherwise it is held at the value shown (the pipeline default).</p>
+            <div id="lbSpace"></div>
+          </div>
+          <div class="card">
+            <h3>Objective &amp; search</h3>
+            <label class="lf">Optimise <select id="lbObj1"></select></label>
+            <label class="lf">…and also <select id="lbObj2"></select></label>
+            <label class="lf">Sampler <select id="lbSampler"></select></label>
+            <div class="lbgrid">
+              <label>Trials <input id="lbTrials" type="number" min="1" value="30"></label>
+              <label>Time limit (min, 0 = none) <input id="lbTimeout" type="number" min="0" value="0"></label>
+              <label>Seed <input id="lbSeed" type="number" value="0"></label>
+              <label>Device <select id="lbDevice"></select></label>
+            </div>
+            <label class="check small"><input id="lbBaseline" type="checkbox" checked> Trial 0 = the pipeline's current settings (the baseline to beat)</label>
+            <button class="btn primary wide" id="lbGo">Start study</button>
+          </div>
+        </div>
+        <div class="labmain">
+          <div class="card"><h3>Studies <button class="btn tiny ghost" id="lbRefresh">Refresh</button></h3><div id="lbStudies" class="lbstudies"></div></div>
+          <div id="lbDetail" class="lbdetail"></div>
+        </div>
+      </div>
+    </section>
   </main>
 </div>
 <div id="toast" class="toast" hidden></div>
 <script src="/static/app.js"></script>
+<script src="/static/explore.js"></script>
+<script src="/static/lab.js"></script>
 </body>
 </html>

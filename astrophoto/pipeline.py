@@ -41,6 +41,8 @@ STACK_DEFAULTS = {
     "imagemm_r": 1,          # super-resolution factor r (Algorithm 2 for r > 1)
     "imagemm_sigma": 0.0,    # g_sigma of Eq. 11 in latent pixels; 0 = none for r = 1, 1.1 for r > 1
     "imagemm_robust": True,  # Algorithm 3 (Huber, delta = 2) instead of the L2 loss
+    "imagemm_delta": 2.0,    # Huber threshold delta of Algorithm 3 (the paper: 2)
+    "imagemm_kappa": 2.0,    # clipping of the multiplicative update, kappa (the paper: 2)
     "imagemm_epsilon": 1e-6,  # stopping tolerance (the paper uses 1e-4 ... 1e-6)
     "imagemm_stop": "c15",   # c15 (Eq. C15, the paper) | elementwise (mean |u'_k/u'_k-1 - 1|)
     "imagemm_max_iters": 1000,
@@ -387,6 +389,7 @@ class Session:
                 lat, info = imagemm.restore(
                     es, r=int(p["imagemm_r"]), sigma=sigma, psf_model=p["imagemm_psf"],
                     n_groups=int(p["imagemm_groups"]), robust=bool(p["imagemm_robust"]),
+                    delta=float(p.get("imagemm_delta", 2.0)), kappa=float(p.get("imagemm_kappa", 2.0)),
                     epsilon=float(p["imagemm_epsilon"]), stop=p.get("imagemm_stop", "c15"),
                     max_iters=int(p["imagemm_max_iters"]),
                     accelerate=bool(p["imagemm_accelerate"]), n2n=bool(p.get("imagemm_n2n")),
