@@ -28,7 +28,8 @@ sys.path.insert(0, ROOT)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 from astrophoto import __version__  # noqa: E402
-from astrophoto.pipeline import DEFAULTS, STACK_DEFAULTS, Cancelled, Session, clean_json, slugify  # noqa: E402
+from astrophoto.pipeline import (DEFAULTS, STACK_DEFAULTS, Cancelled, Session, clean_json,  # noqa: E402
+                                 restoration_done, slugify)
 
 CONFIG = {"images": os.path.join(ROOT, "images"), "workdir": os.path.join(ROOT, "output")}
 
@@ -141,7 +142,7 @@ def datasets(root: str | None = None):
         cache_dir = os.path.join(CONFIG["workdir"], slugify(d))
         info["cached"] = {"analysed": os.path.exists(os.path.join(cache_dir, "analysis.pkl")),
                           "stacked": os.path.exists(os.path.join(cache_dir, "stack.fits")),
-                          "denoised": os.path.exists(os.path.join(cache_dir, "denoised.fits"))}
+                          "denoised": restoration_done(cache_dir)}
         out.append(info)
     return {"root": root, "datasets": out}
 

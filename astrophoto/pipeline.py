@@ -60,6 +60,20 @@ LINEAR_KEYS = ["crop", "crop_threshold", "background", "bg_method", "bg_degree",
                "white_balance", "denoise", "deconvolution"]
 
 
+def restoration_done(session_dir: str) -> bool:
+    """The Restore step has finished: the network output (denoised.fits), or an ImageMM
+    restoration (imagemm.fits, recorded as the last restoration in restore_meta.json)."""
+    if os.path.exists(os.path.join(session_dir, "denoised.fits")):
+        return True
+    meta = os.path.join(session_dir, "restore_meta.json")
+    if os.path.exists(meta) and os.path.exists(os.path.join(session_dir, "imagemm.fits")):
+        try:
+            return json.load(open(meta)).get("deconv_method") == "imagemm"
+        except Exception:
+            return False
+    return False
+
+
 def slugify(path: str) -> str:
     base = os.path.basename(os.path.normpath(path)) or "dataset"
     h = hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:6]
@@ -168,7 +182,7 @@ class Session:
             "n_files": len(self.infos) if self.infos else None,
             "analysed": self.analysis is not None,
             "stacked": os.path.exists(self._p("stack.fits")),
-            "denoised": os.path.exists(self._p("denoised.fits")),
+            "denoised": restoration_done(self.dir),
             "deconvolved": os.path.exists(self._p("sharp.fits")) or os.path.exists(self._p("imagemm.fits")),
             "stack_meta": clean_json(self.meta),
             "filter": self.infos[0].filter if self.infos else None,

@@ -300,11 +300,25 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
     return bg, info
 
 
-def measure_star_colors(img: np.ndarray, sat: float) -> np.ndarray | None:
-    """Aperture photometry of unsaturated stars in each channel -> (N, 3) fluxes."""
+def _extract(data: np.ndarray, thresh: float, err: float, **kw):
+    """sep.extract that raises its threshold instead of failing when a very crowded field
+    overflows the deblending limits (as analysis.measure_stars does)."""
+    for k in range(4):
+        try:
+            return sep.extract(data, thresh * 2 ** k, err=err, **kw)
+        except Exception as e:
+            if "overflow" not in str(e) or k == 3:
+                raise
+
+
+def measure_star_colors(img: np.ndarray, sat: float, noise_floor: float = 0.0) -> np.ndarray | None:
+    """Aperture photometry of unsaturated stars in each channel -> (N, 3) fluxes.
+    ``noise_floor``: per-pixel noise of the data the image came from (for a restoration,
+    whose own sky noise is ~0, the coadd's): detection significance is relative to the
+    larger of it and the image's own background rms."""
     L = np.ascontiguousarray(luminance(img))
     bkg = sep.Background(L, bw=64, bh=64)
-    objs = sep.extract(L - bkg.back(), 8.0, err=bkg.globalrms, minarea=5)
+    objs = _extract(L - bkg.back(), 8.0, max(bkg.globalrms, noise_floor), minarea=5)
     if len(objs) < 10:
         return None
     ok = (objs["peak"] + np.median(bkg.back()) < 0.8 * sat) & (objs["flag"] == 0) & (objs["a"] / np.maximum(objs["b"], 1e-3) < 1.6)
@@ -514,7 +528,7 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
                 y0, y1, x0, x1 = info["crop"]
                 extra = extra[y0:y1, x0:x1]
             wb_src = img + extra
-        fl = measure_star_colors(wb_src, sat)
+        fl = measure_star_colors(wb_src, sat, noise_floor=noise_ref if restored else 0.0)
         del wb_src
         if fl is not None and len(fl) >= 10:
             rg = np.median(fl[:, 0] / fl[:, 1])
@@ -560,13 +574,16 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
 
 # ============================================================ non-linear stage
 
-def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0):
+def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0, noise_floor: float = 0.0):
+    """``noise_floor``: per-pixel noise of the original data at this scale; detection
+    significance is relative to the larger of it and the image's own background rms (after
+    a restoration or ML denoising the image's own noise no longer describes the data)."""
     Lc = np.ascontiguousarray(L, np.float32)
     # a first coarse pass measures the PSF; the background mesh then scales with it so
     # it follows extended light (galaxy discs, nebula ridges) and stars on top of it
     # separate cleanly instead of merging into one large blob
     b0 = sep.Background(Lc, bw=64, bh=64)
-    o0 = sep.extract(Lc - b0.back(), 10.0, err=b0.globalrms, minarea=5)
+    o0 = _extract(Lc - b0.back(), 10.0, max(b0.globalrms, noise_floor), minarea=5)
     fw0 = 3.0
     if len(o0) > 10:
         f0 = 2 * sep.flux_radius(Lc - b0.back(), o0["x"], o0["y"], 6 * o0["a"], 0.5, subpix=5)[0]
@@ -574,8 +591,8 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0):
     mesh = int(np.clip(4.5 * fw0, 12, 64))
     bkg = sep.Background(Lc, bw=mesh, bh=mesh, fw=3, fh=3)
     sub = Lc - bkg.back()
-    rms = bkg.globalrms
-    objs = sep.extract(sub, 4.0, err=rms, minarea=3, deblend_cont=0.002)
+    rms = max(bkg.globalrms, noise_floor)
+    objs = _extract(sub, 4.0, rms, minarea=3, deblend_cont=0.002)
     if len(objs) == 0:
         return objs, rms, 3.0
     fw = 2 * sep.flux_radius(sub, objs["x"], objs["y"], 6 * objs["a"], 0.5, subpix=5)[0]
@@ -622,7 +639,7 @@ def detect_stars_for_mask(L: np.ndarray, px_scale: float = 1.0):
 def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.ndarray | None = None,
               noise_ref: float | None = None) -> np.ndarray:
     """Soft star mask built from photometric star profiles (Gaussian + wings)."""
-    objs, rms, fw = detect_stars_for_mask(L, px_scale)
+    objs, rms, fw = detect_stars_for_mask(L, px_scale, noise_ref or 0.0)
     h, w = L.shape
     mask = np.zeros((h, w), np.float32)
     if len(objs) == 0:
@@ -704,7 +721,8 @@ def star_mask(L: np.ndarray, px_scale: float = 1.0, grow: float = 1.0, rgb: np.n
     return np.clip(mask, 0, 1)
 
 
-def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.0) -> np.ndarray:
+def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.0,
+                          noise_ref: float | None = None) -> np.ndarray:
     """Remove coloured (blue/violet/cyan) halos around bright stars, in linear data.
 
     Small refractors focus blue/violet (and the OIII band) slightly differently,
@@ -716,7 +734,7 @@ def neutralize_star_halos(lin: np.ndarray, strength: float, px_scale: float = 1.
     if strength <= 0:
         return lin
     L = luminance(lin)
-    objs, rms, fw = detect_stars_for_mask(L, px_scale)
+    objs, rms, fw = detect_stars_for_mask(L, px_scale, noise_ref or 0.0)
     if len(objs) == 0:
         return lin
     h, w = L.shape
@@ -1077,7 +1095,9 @@ def nonlinear_stage(lin: np.ndarray, params: dict, filter_name: str = "", px_sca
 
     # --- star separation (in linear space)
     tick("Separating stars")
-    lin = neutralize_star_halos(lin, min(1.0, 1.6 * float(p["halo_suppress"])), px_scale)
+    nref = p.get("_noise_ref")
+    lin = neutralize_star_halos(lin, min(1.0, 1.6 * float(p["halo_suppress"])), px_scale,
+                                noise_ref=(nref * px_scale) if nref else None)
     if p["star_separation"]:
         key = (lin.shape, float(px_scale), float(lin[::97, ::89].sum()))
         if key in _SEP_CACHE:
