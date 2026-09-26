@@ -255,6 +255,11 @@ def background_model(img: np.ndarray, method: str = "auto", degree: int = 2, gri
             vals.append(med)
     pts = np.array(pts)
     vals = np.array(vals)
+    if len(vals) < 6:
+        # no (or too few) star-free sky tiles to fit: remove nothing rather than guess
+        return np.zeros_like(img, dtype=np.float32), {"samples": int(len(vals)), "total": int(ny * nx),
+                                                      "method": "none", "degree": 0,
+                                                      "note": "too few star-free sky tiles: no gradient removed"}
     lum = vals @ np.array([0.2126, 0.7152, 0.0722])
     sel = lum <= np.percentile(lum, 75)
     if method == "auto":
@@ -453,8 +458,9 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
     p = {**DEFAULTS, **(params or {})}
     info = {}
     img = stack
-    Ls = luminance(stack[::2, ::2])
-    noise_ref = mad_sigma(Ls - cv2.GaussianBlur(Ls, (0, 0), 1.5)) * 1.6  # per-pixel noise of raw stack
+    # per-pixel noise of the raw stack (for a restoration: of the coadd it was restored from)
+    Ls = luminance((clip_ref if (restored and clip_ref is not None) else stack)[::2, ::2])
+    noise_ref = mad_sigma(Ls - cv2.GaussianBlur(Ls, (0, 0), 1.5)) * 1.6
     if denoised is not None and p["denoise"] > 0:
         img = stack + float(p["denoise"]) * (denoised - stack)
     ai_deconv = sharp is not None and denoised is not None and p["deconvolution"] > 0
@@ -467,17 +473,32 @@ def linear_stage(stack: np.ndarray, coverage: np.ndarray | None, denoised: np.nd
     img = np.ascontiguousarray(img, np.float32)
     if progress:
         progress(1, 4, "Background extraction")
-    if p["background"]:
-        bg, binfo = background_model(img, p["bg_method"], int(p["bg_degree"]))
-        info["background"] = binfo
-        img = img - bg
+    if restored:
+        # the restoration is already background-subtracted (the ImageMM exposures had the
+        # reference sky model and their own smooth deviations removed) and its zero point is
+        # the sky: no gradient model and no median subtraction (in a nebula-filled field the
+        # median is nebula).  The display pedestal is set from the coadd's sky noise, as for
+        # a stack after neutralisation.
+        info["background"] = {"method": "subtracted before the restoration"}
+        ref = clip_ref if clip_ref is not None else img
+        if info.get("crop") and clip_ref is not None:
+            y0, y1, x0, x1 = info["crop"]
+            ref = ref[y0:y1, x0:x1]
+        ref = ref[::2, ::2]
+        ped = 3 * max(mad_sigma(ref[..., c] - cv2.GaussianBlur(np.ascontiguousarray(ref[..., c]), (0, 0), 1.5)) * 1.6
+                      for c in range(3))
     else:
-        img = img - np.array([np.median(img[..., c][::4, ::4]) for c in range(3)], np.float32)
-    # background neutralisation: equal, small pedestal in every channel
-    s_bg = [mad_sigma(img[..., c][::4, ::4]) for c in range(3)]
-    ped = 3 * max(s_bg)
-    for c in range(3):
-        img[..., c] -= np.median(img[..., c][::4, ::4])
+        if p["background"]:
+            bg, binfo = background_model(img, p["bg_method"], int(p["bg_degree"]))
+            info["background"] = binfo
+            img = img - bg
+        else:
+            img = img - np.array([np.median(img[..., c][::4, ::4]) for c in range(3)], np.float32)
+        # background neutralisation: equal, small pedestal in every channel
+        s_bg = [mad_sigma(img[..., c][::4, ::4]) for c in range(3)]
+        ped = 3 * max(s_bg)
+        for c in range(3):
+            img[..., c] -= np.median(img[..., c][::4, ::4])
     img += ped
     if progress:
         progress(2, 4, "Colour calibration")
