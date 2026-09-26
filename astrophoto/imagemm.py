@@ -194,6 +194,37 @@ def exposure_origin(ks: int, r: int) -> float:
     return (ks - 1) / 2 + (r - 1) / 2
 
 
+def free_device_memory(device: torch.device) -> float | None:
+    """Bytes this process can still allocate on ``device`` (None: no limit known, CPU)."""
+    if device.type == "cuda":
+        free, _ = torch.cuda.mem_get_info(device)
+        # memory PyTorch has reserved but not handed out is available to this process too
+        return float(free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+    if device.type == "mps":
+        try:
+            return float(torch.mps.recommended_max_memory() - torch.mps.driver_allocated_memory())
+        except Exception:
+            return None
+    return None
+
+
+# per exposure, per channel and pixel of a cutout, mm_restore keeps y, v and the mask
+# (3 arrays) and, for the exposures of one chunk, about 8 arrays of temporaries (forward
+# model, residual, weights, their products, the im2col band buffers)
+_PERSISTENT, _PER_CHUNK = 3, 8
+
+
+def auto_chunk(n: int, C: int, d: int, device: torch.device, reserve: float = 0.85) -> int:
+    """Exposures per chunk so that the temporaries of one chunk fit next to the persistent
+    arrays.  The chunking only changes the order of the sums over exposures."""
+    free = free_device_memory(device)
+    if free is None:
+        return n
+    per = C * d * d * 4
+    avail = reserve * free
+    return int(max(1, min(n, avail // (_PER_CHUNK * per))))
+
+
 class Operators:
     """H(t) (convolution of the padded latent with each exposure's kernel, valid part),
     D, and the adjoints H(t)^T and D^T, for a latent x of shape (1, C, X, Y).
@@ -309,10 +340,13 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
     the 1500-iteration solution, the maximum at the brightest star cores), the second at 784
     (max 3.5 %, rms 0.2 %).  Or after max_iters.
     Returns (x, info)."""
-    ops = Operators(kernels, r, chunk)
     n = y.shape[0]
-    W = torch.where(mask > 0, 1.0 / var.clamp_min(1e-30), torch.zeros_like(var))   # W(t) = m(t)/v(t)
-    sd = var.clamp_min(1e-30).sqrt()
+    if chunk is None:
+        chunk = auto_chunk(n, y.shape[1], y.shape[-1], y.device)
+    ops = Operators(kernels, r, chunk)
+
+    def W_(a, b):                       # W(t) = m(t) / v(t), per chunk (not stored for all exposures)
+        return torch.where(mask[a:b] > 0, 1.0 / var[a:b].clamp_min(1e-30), torch.zeros_like(var[a:b]))
     # effective mask m~ of Eq. C15
     frac = torch.zeros_like(x0)
     for a, b in ops.ranges():
@@ -323,7 +357,7 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
     if not robust:                     # Eq. 8: the numerator does not depend on x
         num = torch.zeros_like(x0)
         for a, b in ops.ranges():
-            num += ops.adjoint_sum(W[a:b] * y[a:b], a, b)
+            num += ops.adjoint_sum(W_(a, b) * y[a:b], a, b)
     acc = BiggsAndrews(float(x0.min())) if accelerate else None
     if accelerate:
         # extrapolated steps bring the mean of u'_k / u'_{k-1} to 1 about 100x sooner relative
@@ -340,11 +374,12 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
         den = torch.zeros_like(x0)
         for a, b in ops.ranges():
             fx = ops.forward(xe, a, b)
-            Wk = W[a:b]
+            Wk = W_(a, b)
             if robust:                 # Eq. 17: W_rho = m / v * psi(r),  r = (y - D H x) / sigma  (Eq. 13)
-                Wk = Wk * huber_psi((y[a:b] - fx) / sd[a:b], delta)
+                Wk = Wk * huber_psi((y[a:b] - fx) / var[a:b].clamp_min(1e-30).sqrt(), delta)
                 num += ops.adjoint_sum(Wk * y[a:b], a, b)
             den += ops.adjoint_sum(Wk * fx, a, b)
+            del fx, Wk
         u = torch.where(den > 0, num / den.clamp_min(1e-30), torch.ones_like(den))      # Eq. 8 / 16
         u = u.clamp(1.0 / kappa, kappa)                                                 # Eq. 9
         x_new = xe * u                                                                  # Eq. 7
@@ -365,7 +400,7 @@ def mm_restore(y: torch.Tensor, var: torch.Tensor, mask: torch.Tensor, kernels: 
                 break
         u_prev = u
     return x, {"iterations": k, "converged": converged, "criterion": hist, "effective_mask": m_eff,
-               "coverage": frac / n}
+               "coverage": frac / n, "chunk": chunk}
 
 
 def initial_guess(y: torch.Tensor, mask: torch.Tensor, ks: int, r: int = 1, how: str = "median",
@@ -375,8 +410,16 @@ def initial_guess(y: torch.Tensor, mask: torch.Tensor, ks: int, r: int = 1, how:
     (l - exposure_origin) / r; bilinear, edge values continued into the padding), with
     non-positive pixels replaced by ``floor`` (default 1e-3 x the robust noise level of
     the median image)."""
-    yy = torch.where(mask > 0, y, torch.full_like(y, float("nan")))
-    med = torch.nanmedian(yy, dim=0, keepdim=True).values if how == "median" else torch.nanmean(yy, 0, keepdim=True)
+    # per-pixel statistic over the exposures, in row bands (a masked copy of all exposures at
+    # once would double the memory of the cutout)
+    n, C, h_, w_ = y.shape
+    band = max(1, int(2 ** 26 // max(n * C * w_, 1)))
+    med = torch.empty((1, C, h_, w_), device=y.device, dtype=y.dtype)
+    for r0 in range(0, h_, band):
+        yy = torch.where(mask[:, :, r0:r0 + band] > 0, y[:, :, r0:r0 + band], torch.full_like(y[:, :, r0:r0 + band], float("nan")))
+        med[:, :, r0:r0 + band] = (torch.nanmedian(yy, dim=0, keepdim=True).values if how == "median"
+                                   else torch.nanmean(yy, 0, keepdim=True))
+    del yy
     med = torch.nan_to_num(med, nan=0.0)
     if floor is None:
         dev = 1.4826 * (med - med.median()).abs().median()
@@ -634,6 +677,22 @@ def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empiri
     H0, W0 = es.H0, es.W0
     overlap = int(max(64, 2 * math.ceil(ks / r)))
     tile = max(tile, 3 * overlap)
+    # the exposures of a cutout (y, v, mask) must fit on the device next to at least one
+    # exposure's temporaries; otherwise use smaller cutouts (same overlap, so the same result
+    # up to the blending of more seams - see test_tiling in experiments/test_imagemm.py)
+    free = free_device_memory(dev)
+    n_exp = len(idx) if not n2n else (len(idx) + 1) // 2
+    n_exp = min(n_exp, n_groups) if n_groups else n_exp
+    if free is not None:
+        def need(t):              # bytes: exposures of the cutout + one chunk + ~12 latent-size arrays
+            return 4 * 3 * t * t * (_PERSISTENT * n_exp + _PER_CHUNK) + 4 * 3 * (t * r + ks) ** 2 * 12
+        while tile > 3 * overlap and need(tile) > 0.85 * free:
+            tile = max(3 * overlap, int(tile * 0.85))
+        if need(tile) > 0.85 * free:
+            raise RuntimeError(
+                f"not enough {dev.type.upper()} memory for ImageMM: {free / 2**30:.2f} GiB free, one "
+                f"{tile} px cutout of {n_exp} exposures needs {need(tile) / 2**30:.2f} GiB. Another process may be "
+                f"holding GPU memory (check nvidia-smi), or use seeing groups / another device.")
     step = tile - overlap
     ys = sorted({min(y, max(H0 - tile, 0)) for y in range(0, max(H0 - overlap, 1), step)})
     xs = sorted({min(x, max(W0 - tile, 0)) for x in range(0, max(W0 - overlap, 1), step)})

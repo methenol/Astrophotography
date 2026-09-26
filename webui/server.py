@@ -192,6 +192,7 @@ def _run_job(job_id: str, kind: str, folder: str, params: dict, stack_params: di
     def progress(i, n, msg):
         job["progress"] = i / max(n, 1)
         job["message"] = msg
+        job["stage"] = msg
         if not job["log"] or job["log"][-1][1] != msg.split(" (")[0].rsplit(" ", 1)[0]:
             job["log"].append([round(time.time() - job["started"], 1), msg.split(" (")[0].rsplit(" ", 1)[0]])
             job["log"] = job["log"][-200:]
@@ -230,9 +231,63 @@ def _run_job(job_id: str, kind: str, folder: str, params: dict, stack_params: di
                 job["state"] = "error"
                 job["message"] = f"{type(e).__name__}: {e}"
                 job["traceback"] = traceback.format_exc()
+                job["device_state"] = _device_state()
+                _log_job_error(s, job, kind, stack_params)
         finally:
             job["ended"] = time.time()
             PREVIEW_CACHE.clear()
+            _release_device_memory()
+
+
+def _device_state() -> str:
+    """Memory of the CUDA devices at the moment of a failure (empty without CUDA)."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return ""
+        out = []
+        for d in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(d)
+            out.append(f"cuda:{d} {torch.cuda.get_device_name(d)}: {free / 2**30:.2f} of {total / 2**30:.2f} GiB free; "
+                       f"this process: {torch.cuda.memory_allocated(d) / 2**30:.2f} GiB allocated, "
+                       f"{torch.cuda.memory_reserved(d) / 2**30:.2f} GiB reserved, peak "
+                       f"{torch.cuda.max_memory_allocated(d) / 2**30:.2f} GiB")
+        return "\n".join(out)
+    except Exception as e:
+        return f"(device state unavailable: {e})"
+
+
+def _log_job_error(s, job, kind, stack_params):
+    """Append the failure (stage, settings, traceback, device memory) to the session's
+    job_errors.log, so it survives the browser and the server."""
+    import json as _json
+    try:
+        with open(s._p("job_errors.log"), "a") as f:
+            f.write(f"===== {time.strftime('%Y-%m-%d %H:%M:%S')}  job {job['id']} ({kind}) failed after "
+                    f"{time.time() - job['started']:.1f}s\n")
+            f.write(f"last stage: {job.get('stage')}\n")
+            f.write(f"settings: {_json.dumps(stack_params, default=str)}\n")
+            if job.get("device_state"):
+                f.write(f"devices:\n{job['device_state']}\n")
+            f.write(job["traceback"] + "\n")
+    except Exception:
+        pass
+
+
+def _release_device_memory():
+    """Return the memory PyTorch's caching allocator still holds to the driver after a job
+    (it keeps freed blocks reserved otherwise, including after a failure)."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
 
 
 @app.post("/api/jobs")

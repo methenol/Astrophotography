@@ -30,6 +30,7 @@ function toast(msg, err = false) {
   t.textContent = msg; t.className = "toast" + (err ? " err" : ""); t.hidden = false;
   clearTimeout(t._h); t._h = setTimeout(() => (t.hidden = true), err ? 6000 : 3000);
 }
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "–" : (typeof v === "number" ? v.toFixed(d) : v);
 
 /* ------------------------------------------------------------ init */
@@ -234,6 +235,12 @@ async function pollJob() {
     refreshDiag();
   } else if (j.state === "error") {
     toast(j.message, true); console.error(j.traceback);
+    // keep the failure on screen: the stage it reached, the traceback and the device memory
+    $("#jobCard").hidden = false;
+    $("#progMsg").innerHTML = `<b style="color:var(--bad)">${esc(j.message)}</b> · ${j.elapsed}s` +
+      (j.stage ? `<div class="muted small">Last stage: ${esc(j.stage)}</div>` : "") +
+      `<details open class="small" style="margin-top:6px"><summary>Traceback (also in job_errors.log in the session folder)</summary>` +
+      `<pre class="log" style="max-height:320px;user-select:text">${esc((j.device_state ? j.device_state + "\n\n" : "") + (j.traceback || ""))}</pre></details>`;
   } else toast("Cancelled");
 }
 
