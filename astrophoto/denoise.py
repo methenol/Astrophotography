@@ -460,6 +460,10 @@ def train_n2n_deconv(net: nn.Module, da: np.ndarray, db: np.ndarray, a: np.ndarr
         hess = dxx.pow(2).mean() + dyy.pow(2).mean() + 2 * dxy.pow(2).mean()
         under = F.relu(skyp - margin * sigp - x) / sigp
         loss = chi2 + hessian * hess + floor * under.pow(2).mean()
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"deconvolution network: non-finite loss at step {it} (data {float(chi2):.4g}, "
+                               f"hessian {float(hess):.4g}, network output g in [{float(g.min()):.3g}, "
+                               f"{float(g.max()):.3g}], x in [{float(x.min()):.3g}, {float(x.max()):.3g}])")
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)

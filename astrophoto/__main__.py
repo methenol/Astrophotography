@@ -60,7 +60,8 @@ def main(argv=None):
     r.add_argument("--imagemm-psf", default=STACK_DEFAULTS["imagemm_psf"], choices=["empirical", "moffat"])
     r.add_argument("--imagemm-groups", type=int, default=STACK_DEFAULTS["imagemm_groups"],
                    help="0: every sub (the paper); N: N seeing-group coadds")
-    r.add_argument("--imagemm-accelerate", action="store_true", help="Biggs-Andrews acceleration (not in the paper)")
+    r.add_argument("--no-imagemm-accelerate", action="store_true",
+                   help="plain MM iterations (default: Biggs-Andrews acceleration, same result, ~2x faster)")
     r.add_argument("--imagemm-n2n", action="store_true",
                    help="ImageMM on the even and on the odd subs, combined by a Noise2Noise pass")
     r.add_argument("--network-groups", type=int, default=STACK_DEFAULTS["network_groups"],
@@ -116,7 +117,7 @@ def main(argv=None):
              "imagemm_epsilon": args.imagemm_epsilon, "imagemm_stop": args.imagemm_stop,
              "imagemm_max_iters": args.imagemm_max_iters,
              "imagemm_psf": args.imagemm_psf, "imagemm_groups": args.imagemm_groups,
-             "imagemm_accelerate": args.imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,
+             "imagemm_accelerate": not args.no_imagemm_accelerate, "imagemm_n2n": args.imagemm_n2n,
              "network_groups": args.network_groups}
     files = s.run_all(stack, proc, progress=_progress(), quality=args.quality, upscale=args.upscale)
     print(json.dumps(files, indent=2))

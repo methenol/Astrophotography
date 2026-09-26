@@ -344,6 +344,20 @@ def test_superresolution():
 
 
 
+def test_superresolved_units():
+    """superresolved_kernels: unit-sum kernels, so a flat latent of level L predicts exposures
+    of level L (surface brightness is preserved by D H)."""
+    f = gauss_int(3.6, 15)[None, None].repeat(2, 1)
+    h, _ = M.superresolved_kernels(f.repeat(2, 0), 2, 1.1, device=DEV)
+    s_ = h.sum((-2, -1))
+    kt = torch.from_numpy(h).to(DEV)
+    ops = M.Operators(kt, 2)
+    x = torch.full((1, 2, *M.latent_shape(20, 20, h.shape[-1], 2)), 7.0, device=DEV)
+    y = ops.forward(x, 0, 2)
+    check("super-resolved kernels sum to 1 and preserve surface brightness", np.allclose(s_, 1, atol=1e-4)
+          and float((y - 7).abs().max()) < 1e-3, f"sums {np.round(s_.ravel(), 5)}, flat 7 -> {float(y.mean()):.4f}")
+
+
 def test_batched_psf_solver():
     """refine_psfs (batched) must give each kernel what refine_psf gives it alone."""
     fs = np.stack([gauss_int(w, 15, e=0.1 * i, theta=0.3 * i) for i, w in enumerate((2.8, 3.4, 4.1))])
@@ -412,7 +426,8 @@ def test_mf_data_term():
         for _ in range(40):
             cy, cx = RNG.uniform(10, size - 10, 2)
             truth += RNG.uniform(50, 500) * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * (1.2 * s_) ** 2))
-        truth = np.repeat(truth[None], 3, 0).astype(np.float32)
+        # a sky pedestal as in a real stack: the network sees it, so the targets must carry it too
+        truth = np.repeat(truth[None], 3, 0).astype(np.float32) + np.array([350.0, 430.0, 510.0], np.float32)[:, None, None]
         k = 25 if s_ == 1 else 30
         G = 3
         Ks = []
@@ -525,7 +540,7 @@ def test_empirical_psf():
 if __name__ == "__main__":
     t0 = time.time()
     ALL = [test_operators, test_operator_vs_conv2d, test_stack_forward, test_true_convolution, test_geometry, test_psf_solver, test_restoration,
-           test_superresolution, test_batched_psf_solver, test_moffat, test_seeing_groups, test_mf_data_term, test_tiling, test_empirical_psf]
+           test_superresolution, test_superresolved_units, test_batched_psf_solver, test_moffat, test_seeing_groups, test_mf_data_term, test_tiling, test_empirical_psf]
     chosen = [f for f in ALL if not sys.argv[1:] or f.__name__ in sys.argv[1:]]
     for f in chosen:
         f()

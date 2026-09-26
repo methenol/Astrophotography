@@ -36,7 +36,7 @@ STACK_DEFAULTS = {
     "sensitivity": 1.0,      # frame-rejection aggressiveness
     "denoise_iters": 2000,
     "ai_deconvolution": True,  # train the self-supervised deconvolution network after the denoiser
-    "deconv_method": "network",  # network | imagemm | none
+    "deconv_method": "imagemm",  # imagemm | network | none  (best on held-out subs: experiments/README.md)
     # ImageMM (arXiv:2501.03002) on the individual subs, see astrophoto/imagemm.py
     "imagemm_r": 1,          # super-resolution factor r (Algorithm 2 for r > 1)
     "imagemm_sigma": 0.0,    # g_sigma of Eq. 11 in latent pixels; 0 = none for r = 1, 1.1 for r > 1
@@ -46,7 +46,8 @@ STACK_DEFAULTS = {
     "imagemm_max_iters": 1000,
     "imagemm_psf": "empirical",  # empirical | moffat
     "imagemm_groups": 0,     # 0 = every exposure (the paper); N = N seeing-group coadds
-    "imagemm_accelerate": False,  # Biggs & Andrews extrapolation (not in the paper)
+    "imagemm_accelerate": True,  # Biggs & Andrews extrapolation (not in the paper): the converged
+                                 # result in half the time of the plain run
     "imagemm_n2n": False,    # ImageMM on even / odd subs + Noise2Noise pass
     "network_groups": 0,     # > 0: the network's data term is ImageMM's multi-frame likelihood over
                              # this many seeing-group coadds of the other half's subs
@@ -342,7 +343,12 @@ class Session:
         the odd subs (for the half-A input, which holds the even subs) and of the even subs
         (for half B), with their PSFs on the stack grid - the group PSF for a 1x stack, the
         Eq. 11 kernels (r = scale, g_sigma) for an integer drizzle scale."""
+        import pickle
         from .imagemm import superresolved_kernels
+        cache = self._p(f"imagemm/mf_targets_g{n_groups}_s{sigma:g}_{psf_model}_sky.pkl")
+        if os.path.exists(cache):
+            with open(cache, "rb") as f:
+                return pickle.load(f)
         s = float(self.meta.get("scale", 1.0))
         if abs(s - round(s)) > 1e-6:
             raise RuntimeError("the multi-frame loss needs an integer stack scale (1x or 2x)")
@@ -353,10 +359,17 @@ class Session:
         for parity in (1, 0):                       # half A = even stacker frames -> odd-sub targets
             idx = [k for k in use if k % 2 == parity]
             T_ = es.group_coadds(idx, n_groups, psf_model, progress=progress, cancel=self.cancel_flag.is_set)
+            # the network works in the stack's units, sky pedestal included: put the reference
+            # sky model the exposures were background-subtracted by back into the targets
+            T_["y"] = T_["y"] + es.sky_ref[None]
+            T_["sky_included"] = True
             if s > 1:
                 T_["kernels"], _ = superresolved_kernels(T_["kernels"], s, sigma)
             sets.append(T_)
-        return {"sets": sets, "s": s, "delta": 2.0}
+        mf = {"sets": sets, "s": s, "delta": 2.0}
+        with open(cache, "wb") as f:            # imagemm/ is cleared when the session is restacked
+            pickle.dump(mf, f, protocol=4)
+        return mf
 
     def run_denoise(self, params: dict | None = None, progress=None):
         """Restoration: Noise2Noise denoiser and (optionally) the N2N deconvolution network,

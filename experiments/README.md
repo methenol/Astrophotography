@@ -212,26 +212,77 @@ when blending.
 **Held-out benchmark** (`bench_imagemm.py`). Each method restores from the even subs of a
 512² M 27 window; every odd sub is then predicted through its own PSF. The table reports
 the excess of (y − DHx̂)²/v over 1, which is 0 for a perfect restoration. The other columns
-are the paper's Sec. 5.2 and 5.3 metrics (S_F, σ_sky, PSNR/SSIM against the coadd).
+are the paper's Sec. 5.2 and 5.3 metrics (S_F, σ_sky). The PSFs are the corrected empirical
+PSFs (see below).
 
-| Method | held-out χ² excess, sources (R, G, B) | sky | S_F | σ_sky | iterations, time |
+| Method | held-out χ² excess, sources (R, G, B) | sky | S_F | σ_sky | time |
 |---|---|---|---|---|---|
-| Coadd of the even subs (not deconvolved) | 0.224, 0.167, 0.142 | 0.125, 0.082, 0.069 | 8.8–9.7 | 10.2–12.9 | – |
-| **ImageMM, Algorithm 3 (the paper)** | **0.174, 0.122, 0.115** | 0.125, 0.083, 0.069 | 11.0–11.3 | 0.006–0.009 | 168 s |
-| ImageMM, Algorithm 1 (L2) | 0.175, 0.121, 0.113 | 0.125, 0.083, 0.070 | 10.1–10.7 | 0.012–0.020 | 26 s |
-| ImageMM + Biggs–Andrews | 0.174, 0.121, 0.114 | 0.125, 0.083, 0.069 | 11.4–11.6 | 0.001 | 272 s |
+| Coadd of the even subs (not deconvolved) | 0.207, 0.161, 0.131 | 0.124, 0.081, 0.068 | 8.5–9.7 | 10.2–12.9 | – |
+| ImageMM, Algorithm 3, Eq. C15 (ε = 10⁻⁶) | 0.166, 0.119, 0.107 | 0.124, 0.082, 0.069 | 11.6–12.1 | 0.002–0.005 | 328 s |
+| … elementwise stopping rule | 0.166, 0.119, 0.107 | same | 11.8–12.2 | 0.002–0.003 | 1009 s |
+| **… + Biggs–Andrews acceleration** | **0.166, 0.119, 0.107** | same | 11.8–12.2 | **0.001–0.002** | **168 s** |
+| ImageMM, Algorithm 1 (L2, no outlier protection) | 0.165, 0.116, 0.105 | 0.124, 0.082, 0.069 | 12.4–12.9 | 0.002–0.008 | 243 s |
+| … Moffat PSF models | 0.173, 0.128, 0.112 | 0.124, 0.081, 0.068 | 12.0–12.8 | 0.006–0.007 | 558 s |
+| … 8 seeing groups | 0.166, 0.121, 0.107 | 0.124, 0.082, 0.069 | 12.3–13.1 | 0.002–0.008 | 202 s |
+| … Noise2Noise pass | 0.215, 0.475, 0.700 | 0.124, 0.082, 0.319 | 11.1–12.3 | 1.3–1.9 | 834 s |
+| N2N deconvolution network (window held out of training) | 0.184, 0.127, 0.111 | 0.127, 0.084, 0.070 | 11.7–11.9 | 2.5–4.0 | 1018 s |
+| … with ImageMM's multi-frame loss (8 seeing groups) | 0.174, 0.128, 0.117 | 0.123, 0.081, 0.068 | 12.1–12.2 | 3.4–5.1 | 2817 s |
+| ImageMM 2× super-resolution (Algorithm 2, σ = 1.1, 200 accelerated iterations) | 0.165, 0.116, 0.106 on its 2× grid (0.170, 0.123, 0.109 averaged to 1×) | 0.124, 0.082, 0.069 | 10.4–10.9 | 0.004–0.006 | 3661 s |
 <!-- ROWS -->
 
+**Defaults, chosen from this table.**
+* **Restoration: ImageMM.** It is the best in every channel on held-out subs, ahead of the
+  coadd and of both networks, and its sky noise is about 1000× lower.
+* **Loss: Algorithm 3 (Huber).** L2 is 1–2% better on this metric but has no protection
+  against outliers such as satellites.
+* **PSFs:** measured empirical PSFs, every sub.
+* **Acceleration: on.** It reaches the fully converged result in half the time.
+* **Resolution: 1×.** 2× super-resolution predicts the held-out subs 1–2% better on its own
+  grid, but costs 22× the time (about 18 s per iteration on a 512² window). Eq. C15 also
+  plateaus at about 9·10⁻⁵ at r = 2, so it never declares convergence. On an M4 the full
+  field at 2× would take days, so it is an option.
+* **Moffat PSFs, seeing groups, Noise2Noise pass and the network's multi-frame loss: off.**
+  None of them is better. Groups remain a speed option.
+
+The networks were trained with the benchmark window (plus 64 px) excluded from every
+patch, including the multi-frame targets. They predict the window from half A only, and are
+scored after 2×2 averaging onto the 1× grid.
+
 **Reading the table.**
-* **Held-out prediction.** ImageMM predicts every held-out sub about 25% better on sources
+* **Held-out prediction.** ImageMM predicts every held-out sub about 20% better on sources
   than the coadd does.
 * **Sky.** The sky term is the same for every method. It is a data-level floor (residual
   per-sub background, variance model), not something the restoration causes.
-* **Photometry.** Measured without annulus subtraction, ImageMM/coadd flux is 1.32 in 8 px
-  apertures, 1.09 at 16 px and 1.04 at 32 px. Most of this is the coadd's seeing halo, which
-  falls outside small apertures while ImageMM gathers it back into the core. The residual
-  +4% at 32 px matches the paper's note that ImageMM concentrates sky-background flux into
-  sources.
+* **Robustness.** L2 is 1–2% better on this metric, but it has no protection against outliers
+  in individual subs. In the tests the Huber loss removed a satellite trail completely, which
+  L2 cannot do.
+* **Acceleration.** It reaches the fully converged result, the same as the elementwise
+  stopping rule, in half the time of the paper's stop.
+* **Moffat models.** They fit the subs worse than their own empirical PSFs.
+* **Seeing groups.** They cost nothing on this metric and save time.
+* **Noise2Noise pass.** ImageMM already removes the sky noise the pass is meant to remove,
+  and its unbiased loss down-weights bright pixels, so bright sources come out wrong. It
+  makes the result worse.
+* **Photometry.** Measured without annulus subtraction, ImageMM/coadd flux is about 1.3 in
+  8 px apertures and 1.04 at 32 px. Most of this is the coadd's seeing halo, which small
+  apertures miss while ImageMM gathers it back into the core. The residual +4% at 32 px
+  matches the paper's note that ImageMM concentrates sky-background flux into sources.
+
+**A bug found by this benchmark: biased empirical PSFs.** The first version of the per-sub
+PSF estimator had three flaws:
+* it set the noisy mean's negative pixels to zero *before* normalising;
+* it weighted stars by flux instead of flux²;
+* it kept the full cut-out.
+
+Together these put 22–39% of the PSF flux beyond 2 FWHM, where about 5% is real. The heavy
+wings made ImageMM over-concentrate flux (−0.54 mag in small apertures). The corrected
+estimator:
+* weights stars by flux²;
+* cuts each kernel where its azimuthal profile stops being significant;
+* clips negative pixels only after that cut.
+
+On a synthetic field it matches the true PSF to 0.2% of the peak. On M 27 it leaves 4–11%
+beyond 8 px, and it improved the held-out score (0.174/0.122/0.115 before).
 
 ## Literature consulted
 

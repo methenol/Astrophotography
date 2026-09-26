@@ -45,7 +45,9 @@ METHODS = {
     "imagemm_g8": {"n_groups": 8},
     "imagemm_g16": {"n_groups": 16},
     "imagemm_elementwise": {"stop": "elementwise"},
-    "imagemm_r2": {"r": 2, "sigma": 1.1},             # Algorithm 2, the paper's sigma for r = 2
+    # Algorithm 2, the paper's sigma for r = 2.  Eq. C15 plateaus at ~9e-5 at r = 2 (4x the unknowns
+    # per exposure pixel), so this is scored after a fixed 200 accelerated iterations
+    "imagemm_r2": {"r": 2, "sigma": 1.1, "accelerate": True, "max_iters": 200},
     "imagemm_n2n": {"n2n": True},                    # ImageMM on two disjoint halves of A + Noise2Noise
     "network": {"network": 0},                       # N2N deconvolution network (window held out)
     "network_mf": {"network": 8},                    # ... with the ImageMM multi-frame loss, 8 seeing groups
@@ -87,12 +89,15 @@ def run_network(sess, es, window, groups, dev):
         mf = sess.multiframe_targets(groups, 1.1, "empirical")
         for T_ in mf["sets"]:
             T_["kernels"] = torch.as_tensor(T_["kernels"], dtype=torch.float32, device=dev)
+    log = lambda i, n, msg: print(msg, flush=True) if i % 100 == 1 or i == n else None
     dnet = train_n2n_deconv(copy.deepcopy(net), da, db, a, b, stab, psfs, var, weight, sky, iters=2000,
-                            batch=max(4, batch * 3 // 4), device=dev, sample_mask=mask, mf=mf)
+                            batch=max(4, batch * 3 // 4), device=dev, sample_mask=mask, mf=mf, progress=log)
     # predict the window (with context) from half A only
     ctx = 64 * s
     Y0, Y1, X0, X1 = y0 * s - ctx, y1 * s + ctx, x0 * s - ctx, x1 * s + ctx
     sharp_a = stab.inv(infer(dnet, da[Y0:Y1, X0:X1], tile=tile, tta=8))[ctx:-ctx, ctx:-ctx]
+    print(f"network prediction: finite {np.isfinite(sharp_a).mean():.4f}, range {np.nanmin(sharp_a):.4g} .. "
+          f"{np.nanmax(sharp_a):.4g}", flush=True)
     if s > 1:
         sharp_a = sharp_a.reshape((y1 - y0), s, (x1 - x0), s, 3).mean((1, 3))
     return sharp_a - es.sky_ref[y0:y1, x0:x1]
@@ -229,7 +234,10 @@ def main():
             kern = None
             if r > 1:
                 kern, _ = M.superresolved_kernels(es.kernels(idx_a, opts.get("psf_model", "empirical")), r, sigma, device=dev)
-            x, info = M.restore_cutout(es, *window, idx=idx_a, r=r, kernels=kern, device=dev, max_iters=5000, **opts)
+            log = (lambda k, c: print(f"  {m} it {k} criterion {c:.2e}", flush=True) if k % 50 == 0 else None)
+            mi = opts.pop("max_iters", 5000)
+            x, info = M.restore_cutout(es, *window, idx=idx_a, r=r, kernels=kern, device=dev, max_iters=mi,
+                                       log=log, **opts)
             extra = {"iterations": info["iterations"], "converged": info["converged"]}
         if r > 1:
             # paper metrics against the coadd need a common grid: the latent's s x s block means

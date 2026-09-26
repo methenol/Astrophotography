@@ -117,7 +117,7 @@ def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = No
     if g is None:
         g = gaussian_psf_mc(sigma, 2 * m - 1)
     ft = torch.from_numpy(np.ascontiguousarray(fs, np.float32)).to(device)
-    gt = torch.from_numpy(np.ascontiguousarray(g, np.float32)).to(device)[None, None].expand(1, N, -1, -1).contiguous()
+    gt = torch.from_numpy(np.ascontiguousarray(g, np.float32)).to(device)[None, None]
     scale = ft.abs().amax(dim=(1, 2)).view(N, 1, 1)
     # Adam's steps are ~lr per parameter; optimising z = h / max|f| makes the step lr * max|f|
     z = (unpool(ft[:, None], up)[:, 0] / up ** 2 / scale).clone().requires_grad_(True)
@@ -125,8 +125,13 @@ def refine_psfs(fs: np.ndarray, up: int, sigma: float, g: np.ndarray | None = No
     target = rel_tol * (ft ** 2).mean(dim=(1, 2))
     active = torch.ones(N, dtype=torch.bool, device=device)
 
+    # every kernel correlates the same g_sigma: unfold its m x m patches once (im2col, as conv2d
+    # evaluates a convolution) and apply all N flipped kernels as one matrix product
+    cols = F.unfold(gt[:, :1], m)[0]                                   # (m^2, m^2) patches of g
+
     def model(zz):
-        return pool(F.conv2d(gt, (zz * scale).flip(1, 2)[:, None], groups=N), up)[0]
+        conv = ((zz * scale).flip(1, 2).reshape(N, m * m) @ cols).view(1, N, m, m)
+        return pool(conv, up)[0]
 
     for it in range(max_iters):
         per = ((ft - model(z)) ** 2).mean(dim=(1, 2))
@@ -585,12 +590,18 @@ def n2n_pass(xa: np.ndarray, xb: np.ndarray, iters: int = 2000, patch: int = 128
 
 # ----------------------------------------------------------------- full restoration
 def superresolved_kernels(K: np.ndarray, r: int, sigma: float, device=None, progress=None):
-    """Eq. 11 for every exposure and channel: (n, C, d', d') -> (n, C, r d', r d')."""
+    """Eq. 11 for every exposure and channel: (n, C, d', d') -> (n, C, r d', r d'), divided by r^2.
+
+    With D the r x r *average*, D(h * g_sigma) = f makes h sum to r^2, and the latent x of
+    D(h * x) is in flux per latent pixel (1/r^2 of the exposures' surface brightness).  The
+    kernels h / r^2 describe exactly the same model for r^2 x, so with them the latent is in
+    the exposures' (and the stack's) surface-brightness units - which the initial guess, the
+    stack-grid forward model of the network and the pipeline all assume."""
     n, C, d, _ = K.shape
     if progress:
         progress(0, 1, f"ImageMM: solving Eq. 11 for {n * C} PSFs (r = {r}, sigma = {sigma})")
     h, mse = refine_psfs(K.reshape(n * C, d, d), r, sigma, device=device)
-    return h.reshape(n, C, r * d, r * d), mse
+    return h.reshape(n, C, r * d, r * d) / r ** 2, mse
 
 
 def restore(es, r: int = 1, sigma: float | None = None, psf_model: str = "empirical", n_groups: int = 0,
